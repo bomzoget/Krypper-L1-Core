@@ -17,9 +17,9 @@ type Receipt struct {
 
 type ChainConfig struct {
 	ChainID        uint64
-	Coinbase       Address  // miner for this block
-	RewardPoolAddr Address  // buyback/reserve
-	PoolShare      uint64   // % of gas sent to pool (0-100)
+	Coinbase       Address
+	RewardPoolAddr Address
+	PoolShare      uint64 // percentage 0–100
 }
 
 type Executor struct {
@@ -28,9 +28,13 @@ type Executor struct {
 }
 
 func NewExecutor(state *StateDB, config ChainConfig) *Executor {
-	return &Executor{state: state, config: config}
+	return &Executor{
+		state:  state,
+		config: config,
+	}
 }
 
+// ExecuteBlock processes all transactions of a block sequentially.
 func (e *Executor) ExecuteBlock(b *Block) ([]*Receipt, error) {
 	if b == nil {
 		return nil, errors.New("nil block")
@@ -57,10 +61,11 @@ func (e *Executor) ExecuteBlock(b *Block) ([]*Receipt, error) {
 	return receipts, nil
 }
 
+// ExecuteTx applies one transaction atomically to the state.
 func (e *Executor) ExecuteTx(tx *Transaction) (*Receipt, error) {
 	from := tx.GetFrom()
 	if from.IsZero() {
-		return nil, errors.New("missing sender signature")
+		return nil, errors.New("missing sender")
 	}
 
 	snap := e.state.Snapshot()
@@ -90,16 +95,18 @@ func (e *Executor) ExecuteTx(tx *Transaction) (*Receipt, error) {
 	minerAmt := new(big.Int).Sub(gasFee, poolAmt)
 
 	if poolAmt.Sign() > 0 {
-		e.state.AddBalance(e.config.RewardPoolAddr, poolAmt)
+		_ = e.state.AddBalance(e.config.RewardPoolAddr, poolAmt)
 	}
 	if minerAmt.Sign() > 0 {
-		e.state.AddBalance(e.config.Coinbase, minerAmt)
+		_ = e.state.AddBalance(e.config.Coinbase, minerAmt)
 	}
 
-	return &Receipt{
+	receipt := &Receipt{
 		TxHash:  tx.Hash(),
 		Success: true,
 		GasUsed: tx.GasLimit,
 		Logs:    [][]byte{},
-	}, nil
+	}
+
+	return receipt, nil
 }
