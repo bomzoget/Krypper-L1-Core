@@ -11,14 +11,6 @@ import (
 	"math/big"
 )
 
-/*
-   KRYPPER L1 CORE TRANSACTION MODEL (FINAL)
-   - Anti replay (ChainId included in sign-hash)
-   - From is recovered from signature (not stored)
-   - big.Int length-prefixed → no ambiguity
-   - Cached TxID for performance
-*/
-
 type TxType uint8
 
 const (
@@ -32,7 +24,7 @@ type Signature struct {
 }
 
 type Transaction struct {
-	ChainId   *big.Int  `json:"chainId"` // 🔥 REQUIRED to prevent replay
+	ChainId   *big.Int  `json:"chainId"`
 	Type      TxType    `json:"type"`
 	Nonce     uint64    `json:"nonce"`
 	To        Address   `json:"to"`
@@ -42,11 +34,10 @@ type Transaction struct {
 	Data      []byte    `json:"data"`
 	Signature Signature `json:"sig"`
 
-	from *Address `json:"-"` // derived after signature recovery
-	hash Hash     `json:"-"` // cached TxID
+	from *Address `json:"-"`
+	hash Hash     `json:"-"`
 }
 
-/* Constructor (FIXED) */
 func NewTransferTx(
 	chainId uint64,
 	nonce uint64,
@@ -63,7 +54,7 @@ func NewTransferTx(
 	}
 
 	return &Transaction{
-		ChainId:  new(big.Int).SetUint64(chainId), // 🔥 FIXED (no overflow, no negative wrap)
+		ChainId:  new(big.Int).SetUint64(chainId),
 		Type:     TxTypeTransfer,
 		Nonce:    nonce,
 		To:       to,
@@ -72,23 +63,21 @@ func NewTransferTx(
 		GasLimit: gasLimit,
 		Data:     data,
 		Signature: Signature{
-			R: big.NewInt(0), S: big.NewInt(0), V: 0,
+			R: big.NewInt(0),
+			S: big.NewInt(0),
+			V: 0,
 		},
 	}
 }
 
-/* ------------------------------------------------------- *
-   SIGN-HASH (What user signs)
-   * MUST include ChainID = anti replay
-* ------------------------------------------------------- */
+// HashForSign returns the hash used for signing (without signature fields).
 func (tx *Transaction) HashForSign() Hash {
 	h := sha256.New()
 	var buf [8]byte
 
-	// 1) Chain ID first — critical
+	// ChainId first to prevent cross-chain replay
 	writeBig(h, tx.ChainId)
 
-	// 2) Tx fields
 	h.Write([]byte{byte(tx.Type)})
 
 	binary.BigEndian.PutUint64(buf[:], tx.Nonce)
@@ -113,9 +102,7 @@ func (tx *Transaction) HashForSign() Hash {
 	return out
 }
 
-/* ------------------------------------------------------- *
-   TxID = Hash(payload + signature)
-* ------------------------------------------------------- */
+// Hash returns the transaction ID, including signature.
 func (tx *Transaction) Hash() Hash {
 	if !tx.hash.IsZero() {
 		return tx.hash
@@ -133,23 +120,19 @@ func (tx *Transaction) Hash() Hash {
 	return tx.hash
 }
 
-/* Helper — Secure big serialization */
 func writeBig(w interface{ Write([]byte) (int, error) }, n *big.Int) {
 	if n == nil || n.Sign() == 0 {
-		w.Write([]byte{0})
+		_, _ = w.Write([]byte{0})
 		return
 	}
 	b := n.Bytes()
-	w.Write([]byte{uint8(len(b))})
-	w.Write(b)
+	_, _ = w.Write([]byte{uint8(len(b))})
+	_, _ = w.Write(b)
 }
 
-/* ------------------------------------------------------- *
-   Basic validation
-* ------------------------------------------------------- */
 func (tx *Transaction) ValidateBasic() error {
 	if tx == nil {
-		return errors.New("nil tx")
+		return errors.New("nil transaction")
 	}
 	if tx.ChainId == nil || tx.ChainId.Sign() <= 0 {
 		return errors.New("invalid chainId")
@@ -169,7 +152,10 @@ func (tx *Transaction) ValidateBasic() error {
 	return nil
 }
 
-func (tx *Transaction) SetFrom(a Address) { tx.from = &a }
+func (tx *Transaction) SetFrom(a Address) {
+	tx.from = &a
+}
+
 func (tx *Transaction) GetFrom() Address {
 	if tx.from == nil {
 		return Address{}
@@ -177,4 +163,6 @@ func (tx *Transaction) GetFrom() Address {
 	return *tx.from
 }
 
-func (tx *Transaction) String() string { return "Tx{" + hex.EncodeToString(tx.Hash()[:]) + "}" }
+func (tx *Transaction) String() string {
+	return "Tx{" + hex.EncodeToString(tx.Hash()[:]) + "}"
+}
