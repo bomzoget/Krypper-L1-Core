@@ -10,19 +10,17 @@ import (
 	"math/big"
 )
 
-/* ========================= *
-       ACCOUNT STRUCT
-* ========================= */
-
+// Account represents a single world-state account.
 type Account struct {
 	Address     Address  `json:"address"`
 	Balance     *big.Int `json:"balance"`
 	Nonce       uint64   `json:"nonce"`
 	CodeHash    Hash     `json:"codeHash"`
 	StorageRoot Hash     `json:"storageRoot"`
-	Frozen      bool     `json:"frozen"` // used for slashing / penalties
+	Frozen      bool     `json:"frozen"`
 }
 
+// NewAccount initializes a zeroed account for a given address.
 func NewAccount(addr Address) *Account {
 	return &Account{
 		Address:     addr,
@@ -34,48 +32,7 @@ func NewAccount(addr Address) *Account {
 	}
 }
 
-/* ========================= *
-       ACCOUNT → HASH
-* ========================= */
-
-func (a *Account) Hash() Hash {
-	hasher := sha256.New()
-
-	// 1) Address — deterministic, fixed length
-	hasher.Write(a.Address[:])
-
-	// 2) Balance — include zero cleanly (no empty hash ambiguity)
-	if a.Balance != nil && a.Balance.Sign() != 0 {
-		hasher.Write(a.Balance.Bytes())
-	} else {
-		hasher.Write([]byte{0}) // critical fix
-	}
-
-	// 3) Nonce — encoded as uint64
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], a.Nonce)
-	hasher.Write(buf[:])
-
-	// 4) Smart Contract compatibility fields
-	hasher.Write(a.CodeHash[:])
-	hasher.Write(a.StorageRoot[:])
-
-	// 5) Security flag
-	if a.Frozen {
-		hasher.Write([]byte{1})
-	} else {
-		hasher.Write([]byte{0})
-	}
-
-	out := Hash{}
-	copy(out[:], hasher.Sum(nil))
-	return out
-}
-
-/* ========================= *
-      MUTATION FUNCTIONS
-* ========================= */
-
+// Copy returns a deep copy of the account.
 func (a *Account) Copy() *Account {
 	if a == nil {
 		return nil
@@ -127,4 +84,41 @@ func (a *Account) IncrementNonce() error {
 	}
 	a.Nonce++
 	return nil
+}
+
+// Hash computes a hash of the account state for use in state roots.
+func (a *Account) Hash() Hash {
+	h := sha256.New()
+
+	// Address
+	h.Write(a.Address[:])
+
+	// Balance (length-prefixed big-int)
+	if a.Balance != nil && a.Balance.Sign() != 0 {
+		b := a.Balance.Bytes()
+		h.Write([]byte{uint8(len(b))})
+		h.Write(b)
+	} else {
+		h.Write([]byte{0})
+	}
+
+	// Nonce
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], a.Nonce)
+	h.Write(buf[:])
+
+	// Code and storage roots
+	h.Write(a.CodeHash[:])
+	h.Write(a.StorageRoot[:])
+
+	// Frozen flag
+	if a.Frozen {
+		h.Write([]byte{1})
+	} else {
+		h.Write([]byte{0})
+	}
+
+	var out Hash
+	copy(out[:], h.Sum(nil))
+	return out
 }
