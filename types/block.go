@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Dev KryperAI
+
 package types
 
 import (
@@ -8,6 +9,10 @@ import (
 	"encoding/hex"
 	"errors"
 )
+
+/* ========================= *
+    BASE PRIMITIVES
+* ========================= */
 
 type Hash [32]byte
 
@@ -20,6 +25,10 @@ func (a Address) String() string { return "0x" + hex.EncodeToString(a[:]) }
 func (a Address) IsZero() bool   { return a == Address{} }
 
 type BlockHeight uint64
+
+/* ========================= *
+          BLOCK HEADER
+* ========================= */
 
 type BlockHeader struct {
 	ParentHash   Hash        `json:"parentHash"`
@@ -34,10 +43,57 @@ type BlockHeader struct {
 	Extra        []byte      `json:"extra"`
 }
 
+/* ========================= *
+           BLOCK BODY
+* ========================= */
+
 type Block struct {
 	Header       BlockHeader `json:"header"`
 	Transactions [][]byte    `json:"txs"`
 }
+
+/* ========================= *
+      MERKLE IMPLEMENTATION
+* ========================= */
+
+func MerkleRoot(txs [][]byte) Hash {
+	if len(txs) == 0 {
+		return ZeroHash()
+	}
+
+	// Hash each transaction → leaf
+	var hashes []Hash
+	for _, tx := range txs {
+		sum := sha256.Sum256(tx)
+		hashes = append(hashes, sum)
+	}
+
+	// Build trees upward
+	for len(hashes) > 1 {
+		// odd → duplicate last
+		if len(hashes)%2 != 0 {
+			hashes = append(hashes, hashes[len(hashes)-1])
+		}
+
+		var next []Hash
+		for i := 0; i < len(hashes); i += 2 {
+			h := sha256.Sum256(append(hashes[i][:], hashes[i+1][:]...))
+			next = append(next, h)
+		}
+		hashes = next
+	}
+
+	return hashes[0]
+}
+
+// Called only when BUILDING blocks
+func (b *Block) ComputeRoots() {
+	b.Header.TxRoot = MerkleRoot(b.Transactions)
+}
+
+/* ========================= *
+      HEADER HASH = BLOCK ID
+* ========================= */
 
 func (h *BlockHeader) HashHeader() Hash {
 	hasher := sha256.New()
@@ -63,6 +119,7 @@ func (h *BlockHeader) HashHeader() Hash {
 
 	hasher.Write(h.Proposer[:])
 
+	// extra must be length-prefix for security
 	binary.BigEndian.PutUint64(buf[:], uint64(len(h.Extra)))
 	hasher.Write(buf[:])
 
@@ -75,9 +132,14 @@ func (h *BlockHeader) HashHeader() Hash {
 	return out
 }
 
+// ⛔ no mutation inside — read only = SAFE
 func (b *Block) ID() Hash {
 	return b.Header.HashHeader()
 }
+
+/* ========================= *
+       VALIDATION RULES
+* ========================= */
 
 func (b *Block) ValidateBasic() error {
 	if b == nil {
@@ -100,6 +162,11 @@ func (b *Block) ValidateBasic() error {
 	}
 	if len(h.Extra) > 1024 {
 		return errors.New("extra too large")
+	}
+
+	// verify TxRoot authenticity
+	if h.TxRoot != MerkleRoot(b.Transactions) {
+		return errors.New("invalid merkle root: tx mismatch")
 	}
 
 	return nil
