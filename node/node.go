@@ -11,24 +11,26 @@ import (
 	"krypper-chain/types"
 )
 
-// Node represents a single KRYPPER L1 execution node with mining loop.
 type Node struct {
 	mu sync.RWMutex
 
-	Chain        *types.Blockchain
-	State        *types.StateDB
-	Mempool      *types.Mempool
-	Executor     *types.Executor
+	Chain    *types.Blockchain
+	State    *types.StateDB
+	Mempool  *types.Mempool
+	Executor *types.Executor
+
 	MinerAddress types.Address
 
-	// Tier-3 mobile witnesses queued for the next blocks
-	WitnessQueue []types.Witness
+	// Tier-3 mobile witnesses
+	witnessQueue []types.Witness
+
+	// Tier-2 validator votes, keyed by block height
+	validatorVotes map[uint64][]types.ValidatorVote
 
 	Running   bool
 	BlockTime time.Duration
 }
 
-// NewNode creates a new node instance.
 func NewNode(
 	chain *types.Blockchain,
 	state *types.StateDB,
@@ -37,17 +39,17 @@ func NewNode(
 	minerAddr types.Address,
 ) *Node {
 	return &Node{
-		Chain:        chain,
-		State:        state,
-		Mempool:      mem,
-		Executor:     exec,
-		MinerAddress: minerAddr,
-		BlockTime:    3 * time.Second,
-		WitnessQueue: make([]types.Witness, 0),
+		Chain:          chain,
+		State:          state,
+		Mempool:        mem,
+		Executor:       exec,
+		MinerAddress:   minerAddr,
+		BlockTime:      5 * time.Second,
+		witnessQueue:   make([]types.Witness, 0),
+		validatorVotes: make(map[uint64][]types.ValidatorVote),
 	}
 }
 
-// Start begins the mining loop.
 func (n *Node) Start() {
 	n.mu.Lock()
 	if n.Running {
@@ -57,75 +59,125 @@ func (n *Node) Start() {
 	n.Running = true
 	n.mu.Unlock()
 
-	log.Println("NODE: started mining loop")
-	go n.minerLoop()
+	log.Println("[node] started, mining loop active")
+	go n.miningLoop()
 }
 
-// Stop stops the mining loop.
 func (n *Node) Stop() {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	n.Running = false
-	log.Println("NODE: stopped")
+	n.mu.Unlock()
+	log.Println("[node] stopped")
 }
 
-// AddWitness enqueues a tier-3 witness attestation.
+func (n *Node) IsRunning() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.Running
+}
+
+// AddWitness enqueues a Tier-3 witness for the next blocks.
 func (n *Node) AddWitness(w types.Witness) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	n.WitnessQueue = append(n.WitnessQueue, w)
+	n.witnessQueue = append(n.witnessQueue, w)
 }
 
-// minerLoop produces blocks periodically while the node is running.
-func (n *Node) minerLoop() {
+// AddValidatorVote stores a Tier-2 validator vote for the current head block.
+func (n *Node) AddValidatorVote(v types.ValidatorVote) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// Stateless verify
+	_, err := types.VerifyValidatorVote(&v)
+	if err != nil {
+		return err
+	}
+
+	head := n.Chain.Head()
+	if head == nil {
+		return nil
+	}
+
+	// Only accept votes for current head
+	if v.Height != head.Header.Height || v.BlockHash != head.Hash() {
+		return nil
+	}
+
+	list := n.validatorVotes[v.Height]
+	// Deduplicate by validator address
+	for _, existing := range list {
+		if existing.Validator == v.Validator {
+			return nil
+		}
+	}
+
+	n.validatorVotes[v.Height] = append(list, v)
+	return nil
+}
+
+// miningLoop periodically attempts to build and commit new blocks from the mempool.
+func (n *Node) miningLoop() {
 	ticker := time.NewTicker(n.BlockTime)
 	defer ticker.Stop()
 
 	for {
-		n.mu.RLock()
-		running := n.Running
-		n.mu.RUnlock()
-
-		if !running {
+		if !n.IsRunning() {
 			return
 		}
 
 		<-ticker.C
 
-		// pick transactions from mempool
+		// Select transactions from mempool
 		txs := n.Mempool.PopForBlock(100)
 		if len(txs) == 0 {
 			continue
 		}
 
-		n.createBlock(txs)
+		if err := n.createAndSubmitBlock(txs); err != nil {
+			log.Printf("[node] mining error: %v\n", err)
+		}
 	}
 }
 
-// createBlock builds, dry-runs, and submits a new block to the chain.
-func (n *Node) createBlock(txs []*types.Transaction) {
+// createAndSubmitBlock builds a new block with selected txs and submits it to the chain.
+func (n *Node) createAndSubmitBlock(txs []*types.Transaction) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	head := n.Chain.Head()
 	if head == nil {
-		log.Println("NODE: cannot mine, no genesis head")
-		return
+		log.Println("[node] cannot mine: no head block")
+		return nil
 	}
 
-	// pick a witness (tier-3 mobile) if any are queued
+	// --- pick witness (Tier-3) ---
 	var witnessAddr types.Address
-	n.mu.Lock()
-	if len(n.WitnessQueue) > 0 {
-		w := n.WitnessQueue[0]
+	if len(n.witnessQueue) > 0 {
+		w := n.witnessQueue[0]
 		witnessAddr = w.Address
-		n.WitnessQueue = n.WitnessQueue[1:]
+		// remove used witness
+		n.witnessQueue = n.witnessQueue[1:]
 	}
-	n.mu.Unlock()
 
-	header := types.BlockHeader{
+	// --- pick validator (Tier-2) ---
+	var validatorAddr types.Address
+	parentHeight := head.Header.Height
+	if votes, ok := n.validatorVotes[parentHeight]; ok && len(votes) > 0 {
+		// for now: pick the first vote
+		validatorAddr = votes[0].Validator
+		// clear stored votes for this height to avoid unbounded growth
+		delete(n.validatorVotes, parentHeight)
+	}
+
+	// build header skeleton
+	header := &types.BlockHeader{
 		ParentHash: head.Hash(),
 		Height:     head.Header.Height + 1,
 		Timestamp:  time.Now().Unix(),
 		Proposer:   n.MinerAddress,
+		Validator:  validatorAddr,
 		Witness:    witnessAddr,
 		GasLimit:   30_000_000,
 	}
@@ -133,30 +185,31 @@ func (n *Node) createBlock(txs []*types.Transaction) {
 	// dry-run execution to compute StateRoot
 	snap := n.State.Snapshot()
 
-	n.Executor.SetCoinbase(n.MinerAddress)
+	// ensure the executor knows which block header is currently being executed
+	n.Executor.SetCurrentHeader(header)
 
 	for _, tx := range txs {
-		_, err := n.Executor.ExecuteTx(tx)
-		if err != nil {
+		if _, err := n.Executor.ExecuteTx(tx); err != nil {
+			// revert and drop this block attempt
 			n.State.RevertToSnapshot(snap)
-			log.Printf("NODE: dry-run failed for tx %s: %v\n", tx.Hash().String(), err)
-			return
+			return err
 		}
 	}
 
 	header.StateRoot = n.State.StateRoot()
 
-	// revert dry-run; Blockchain.AddBlock will execute again and commit for real
+	// revert dry-run; Blockchain.AddBlock will run execution again atomically
 	n.State.RevertToSnapshot(snap)
 
-	block := types.NewBlock(&header, txs)
+	// finalize block
+	block := types.NewBlock(header, txs)
 	block.ComputeTxRoot()
 
+	// submit to chain (this will do a real execution + state root check + commit)
 	if err := n.Chain.AddBlock(block); err != nil {
-		log.Printf("NODE: failed to add block #%d: %v\n", header.Height, err)
-		return
+		return err
 	}
 
-	log.Printf("NODE: mined block #%d hash=%s witness=%s\n",
-		header.Height, block.Hash().String(), header.Witness.String())
+	log.Printf("[node] new block committed: height=%d hash=%s\n", block.Header.Height, block.Hash().String())
+	return nil
 }
