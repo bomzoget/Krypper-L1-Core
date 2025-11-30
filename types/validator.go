@@ -7,154 +7,116 @@ import (
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
-// ValidatorVote represents a Tier-2 validator attestation for a block.
+// ValidatorVote represents a Tier2 validator attestation for a block.
 type ValidatorVote struct {
-	ChainID   uint64  `json:"chainId"`
-	Height    uint64  `json:"height"`
-	BlockHash Hash    `json:"blockHash"`
-	Validator Address `json:"validator"`
-	Signature []byte  `json:"signature"`
+	ChainID uint64 `json:"chainId"`
+	Height  uint64 `json:"height"`
+	Block   Hash   `json:"blockHash"`
+
+	Voter Address `json:"voter"`
+
+	R *big.Int `json:"r"`
+	S *big.Int `json:"s"`
+	V uint8    `json:"v"`
 }
 
-// String returns a short debug string for the vote.
-func (v *ValidatorVote) String() string {
-	return "ValidatorVote{height=" + uintToString(v.Height) +
-		", hash=" + v.BlockHash.String() +
-		", validator=" + v.Validator.String() + "}"
-}
+func (v *ValidatorVote) hashForSign() Hash {
+	h := sha256.New()
+	var buf [8]byte
 
-// SigningHash builds the canonical hash that is actually signed by the validator.
-func (v *ValidatorVote) SigningHash() Hash {
-	var (
-		buf   [8]byte
-		h     = sha256.New()
-		zero  Hash
-		out   Hash
-	)
-
-	// ChainID
 	binary.BigEndian.PutUint64(buf[:], v.ChainID)
 	h.Write(buf[:])
 
-	// Height
 	binary.BigEndian.PutUint64(buf[:], v.Height)
 	h.Write(buf[:])
 
-	// Block hash
-	if v.BlockHash == zero {
-		// still write 32 zero bytes to keep format stable
-		h.Write(zero[:])
-	} else {
-		h.Write(v.BlockHash[:])
-	}
+	h.Write(v.Block[:])
+	h.Write(v.Voter[:])
 
-	// Validator address
-	h.Write(v.Validator[:])
-
-	sum := h.Sum(nil)
-	copy(out[:], sum)
+	var out Hash
+	copy(out[:], h.Sum(nil))
 	return out
 }
 
-// SignValidatorVote creates and signs a new ValidatorVote.
-func SignValidatorVote(priv *ecdsa.PrivateKey, chainID, height uint64, blockHash Hash) (*ValidatorVote, error) {
+// SignValidatorVote builds a vote and signs it with the given private key.
+func SignValidatorVote(
+	priv *ecdsa.PrivateKey,
+	chainID uint64,
+	height uint64,
+	blockHash Hash,
+) (*ValidatorVote, error) {
 	if priv == nil {
 		return nil, errors.New("nil private key")
 	}
 
-	validatorAddr := PubKeyToAddress(&priv.PublicKey)
+	voter := PubKeyToAddress(&priv.PublicKey)
 
 	vote := &ValidatorVote{
-		ChainID:   chainID,
-		Height:    height,
-		BlockHash: blockHash,
-		Validator: validatorAddr,
+		ChainID: chainID,
+		Height:  height,
+		Block:   blockHash,
+		Voter:   voter,
+		R:       big.NewInt(0),
+		S:       big.NewInt(0),
+		V:       0,
 	}
 
-	hash := vote.SigningHash()
+	h := vote.hashForSign()
 
-	sig, err := signHashSECP(priv, hash)
+	sig, err := crypto.Sign(h[:], priv)
 	if err != nil {
 		return nil, err
 	}
-	vote.Signature = sig
+
+	if len(sig) != 65 {
+		return nil, errors.New("unexpected signature length")
+	}
+
+	vote.R = new(big.Int).SetBytes(sig[0:32])
+	vote.S = new(big.Int).SetBytes(sig[32:64])
+	vote.V = sig[64]
+
 	return vote, nil
 }
 
-// VerifyValidatorVote verifies the signature and returns the recovered address.
-func VerifyValidatorVote(vote *ValidatorVote) (Address, error) {
-	var zeroAddr Address
+// VerifyValidatorVote checks signature and returns the recovered voter address.
+func VerifyValidatorVote(v *ValidatorVote) (Address, error) {
+	var zero Address
 
-	if vote == nil {
-		return zeroAddr, errors.New("nil vote")
-	}
-	if len(vote.Signature) == 0 {
-		return zeroAddr, errors.New("empty signature")
+	if v == nil {
+		return zero, errors.New("nil vote")
 	}
 
-	hash := vote.SigningHash()
+	msgHash := v.hashForSign()
 
-	addr, err := recoverAddressFromSig(hash, vote.Signature)
+	rBytes := v.R.Bytes()
+	sBytes := v.S.Bytes()
+
+	rPadded := make([]byte, 32)
+	sPadded := make([]byte, 32)
+	copy(rPadded[32-len(rBytes):], rBytes)
+	copy(sPadded[32-len(sBytes):], sBytes)
+
+	sig := make([]byte, 65)
+	copy(sig[0:32], rPadded)
+	copy(sig[32:64], sPadded)
+	sig[64] = v.V
+
+	pubKey, err := crypto.SigToPub(msgHash[:], sig)
 	if err != nil {
-		return zeroAddr, err
+		return zero, err
 	}
 
-	if addr != vote.Validator {
-		return zeroAddr, errors.New("validator mismatch")
+	recovered := PubKeyToAddress(pubKey)
+	if recovered != v.Voter {
+		return zero, errors.New("voter mismatch")
 	}
 
-	return addr, nil
-}
-
-// signHashSECP signs a 32-byte hash using secp256k1 and returns 65-byte signature (R||S||V).
-func signHashSECP(priv *ecdsa.PrivateKey, hash Hash) ([]byte, error) {
-	sig, err := crypto.Sign(hash[:], priv)
-	if err != nil {
-		return nil, err
-	}
-	return sig, nil
-}
-
-// recoverAddressFromSig recovers the address from hash and signature.
-func recoverAddressFromSig(hash Hash, sig []byte) (Address, error) {
-	var zeroAddr Address
-
-	if len(sig) != 65 {
-		return zeroAddr, errors.New("invalid signature length")
-	}
-
-	pubKey, err := crypto.SigToPub(hash[:], sig)
-	if err != nil {
-		return zeroAddr, err
-	}
-
-	addr := PubKeyToAddress(pubKey)
-	return addr, nil
-}
-
-// Helper: Uint to string without importing strconv in this file.
-func uintToString(v uint64) string {
-	if v == 0 {
-		return "0"
-	}
-	var buf [32]byte
-	i := len(buf)
-	for v > 0 {
-		i--
-		buf[i] = byte('0' + v%10)
-		v /= 10
-	}
-	return string(buf[i:])
-}
-
-// DebugHex returns a hex string for the vote signature (optional helper).
-func (v *ValidatorVote) SigHex() string {
-	return "0x" + hex.EncodeToString(v.Signature)
+	return recovered, nil
 }
