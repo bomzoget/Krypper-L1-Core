@@ -5,66 +5,37 @@ package types
 
 import (
 	"crypto/ecdsa"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"math/big"
 
-	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 )
 
-// Wallet represents a local keypair and derived address.
-type Wallet struct {
-	PrivateKey *ecdsa.PrivateKey
-	Address    Address
-}
-
-// NewWallet generates a new secp256k1 keypair.
-func NewWallet() (*Wallet, error) {
-	priv, err := ethcrypto.GenerateKey()
+// GenerateKey creates a new ECDSA private key and its corresponding address.
+func GenerateKey() (*ecdsa.PrivateKey, Address, error) {
+	priv, err := gethcrypto.GenerateKey()
 	if err != nil {
-		return nil, err
+		return nil, Address{}, err
 	}
-	addr := pubKeyToAddress(&priv.PublicKey)
-	return &Wallet{
-		PrivateKey: priv,
-		Address:    addr,
-	}, nil
+	addr := PubKeyToAddress(&priv.PublicKey)
+	return priv, addr, nil
 }
 
-// PrivateKeyToHex exports the private key as hex string (without 0x prefix).
-func PrivateKeyToHex(priv *ecdsa.PrivateKey) (string, error) {
-	if priv == nil {
-		return "", errors.New("nil private key")
-	}
-	bytes := ethcrypto.FromECDSA(priv)
-	return hex.EncodeToString(bytes), nil
-}
-
-// PrivateKeyFromHex parses a hex-encoded private key.
-func PrivateKeyFromHex(hexKey string) (*ecdsa.PrivateKey, error) {
-	if hexKey == "" {
-		return nil, errors.New("empty key string")
-	}
-	bytes, err := hex.DecodeString(hexKey)
-	if err != nil {
-		return nil, err
-	}
-	return ethcrypto.ToECDSA(bytes)
-}
-
-// pubKeyToAddress derives a KRYPPER-style Address from an ECDSA public key.
-// Same scheme as Ethereum: last 20 bytes of keccak256(uncompressed pubkey[1:]).
-func pubKeyToAddress(pub *ecdsa.PublicKey) Address {
-	pubBytes := ethcrypto.FromECDSAPub(pub) // 65 bytes: 0x04 || X || Y
-	hash := ethcrypto.Keccak256(pubBytes[1:])
+// PubKeyToAddress derives a KRYPPER Address from an ECDSA public key.
+func PubKeyToAddress(pub *ecdsa.PublicKey) Address {
+	ethAddr := gethcrypto.PubkeyToAddress(*pub) // 20 bytes
 	var addr Address
-	copy(addr[:], hash[12:])
+	copy(addr[:], ethAddr.Bytes())
 	return addr
 }
 
-// SignTransaction signs the transaction payload with the given private key.
-// It fills tx.Signature and tx.from, and clears cached hash.
+// PrivateKeyToAddress derives an address directly from a private key.
+func PrivateKeyToAddress(priv *ecdsa.PrivateKey) Address {
+	return PubKeyToAddress(&priv.PublicKey)
+}
+
+// SignTransaction signs the transaction with the given private key.
+// It fills tx.Signature and caches tx.from.
 func SignTransaction(tx *Transaction, priv *ecdsa.PrivateKey) error {
 	if tx == nil {
 		return errors.New("nil transaction")
@@ -73,14 +44,20 @@ func SignTransaction(tx *Transaction, priv *ecdsa.PrivateKey) error {
 		return errors.New("nil private key")
 	}
 
-	h := tx.HashForSign()
+	// Basic stateless validation first.
+	if err := tx.ValidateBasic(); err != nil {
+		return err
+	}
 
-	sig, err := ethcrypto.Sign(h[:], priv)
+	// Hash payload (includes ChainID, type, nonce, value, gas, data)
+	payload := tx.HashForSign()
+
+	sig, err := gethcrypto.Sign(payload[:], priv)
 	if err != nil {
 		return err
 	}
 	if len(sig) != 65 {
-		return errors.New("unexpected signature length")
+		return errors.New("invalid signature length")
 	}
 
 	r := new(big.Int).SetBytes(sig[0:32])
@@ -91,15 +68,18 @@ func SignTransaction(tx *Transaction, priv *ecdsa.PrivateKey) error {
 	tx.Signature.S = s
 	tx.Signature.V = v
 
-	addr := pubKeyToAddress(&priv.PublicKey)
-	tx.SetFrom(addr)
-	tx.hash = Hash{} // clear cached hash
+	// Reset cached tx hash since signature changed.
+	tx.hash = Hash{}
+
+	// Cache sender address from private key.
+	from := PubKeyToAddress(&priv.PublicKey)
+	tx.from = &from
 
 	return nil
 }
 
 // RecoverTxSender recovers the sender address from the transaction signature.
-// It also caches the result in tx.from.
+// It also caches tx.from if recovery succeeds.
 func RecoverTxSender(tx *Transaction) (Address, error) {
 	if tx == nil {
 		return Address{}, errors.New("nil transaction")
@@ -108,59 +88,61 @@ func RecoverTxSender(tx *Transaction) (Address, error) {
 		return Address{}, errors.New("missing signature components")
 	}
 
-	h := tx.HashForSign()
-
+	// Rebuild 65-byte signature from R, S, V.
 	sig := make([]byte, 65)
-	rBytes := tx.Signature.R.Bytes()
-	sBytes := tx.Signature.S.Bytes()
 
-	copy(sig[32-len(rBytes):32], rBytes)
-	copy(sig[64-len(sBytes):64], sBytes)
+	rBytes := padTo32(tx.Signature.R.Bytes())
+	sBytes := padTo32(tx.Signature.S.Bytes())
+
+	copy(sig[0:32], rBytes)
+	copy(sig[32:64], sBytes)
 	sig[64] = byte(tx.Signature.V)
 
-	pubKey, err := ethcrypto.SigToPub(h[:], sig)
+	// Hash payload exactly as during signing.
+	payload := tx.HashForSign()
+
+	pubKey, err := gethcrypto.SigToPub(payload[:], sig)
 	if err != nil {
 		return Address{}, err
 	}
 
-	addr := pubKeyToAddress(pubKey)
-	tx.SetFrom(addr)
+	addr := PubKeyToAddress(pubKey)
+	tx.from = &addr
 
 	return addr, nil
 }
 
-// VerifyTxSignature checks that the transaction signature is valid
-// for its sign-hash payload.
-func VerifyTxSignature(tx *Transaction) error {
+// VerifyTxSignature verifies that the transaction signature is valid.
+// If tx.from is already set, it ensures the recovered address matches it.
+func VerifyTxSignature(tx *Transaction) (bool, error) {
 	if tx == nil {
-		return errors.New("nil transaction")
-	}
-	if tx.Signature.R == nil || tx.Signature.S == nil {
-		return errors.New("missing signature components")
+		return false, errors.New("nil transaction")
 	}
 
-	h := tx.HashForSign()
-
-	sig := make([]byte, 65)
-	rBytes := tx.Signature.R.Bytes()
-	sBytes := tx.Signature.S.Bytes()
-
-	copy(sig[32-len(rBytes):32], rBytes)
-	copy(sig[64-len(sBytes):64], sBytes)
-	sig[64] = byte(tx.Signature.V)
-
-	pubKey, err := ethcrypto.SigToPub(h[:], sig)
+	recovered, err := RecoverTxSender(tx)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	pubBytes := ethcrypto.FromECDSAPub(pubKey)
-	if !ethcrypto.VerifySignature(pubBytes[1:], h[:], sig[:64]) {
-		return errors.New("invalid transaction signature")
+	expected := tx.GetFrom()
+	if expected.IsZero() {
+		// No expected sender set, accept recovered as authoritative.
+		tx.from = &recovered
+		return true, nil
 	}
 
-	addr := pubKeyToAddress(pubKey)
-	tx.SetFrom(addr)
+	if recovered != expected {
+		return false, errors.New("signature does not match sender")
+	}
+	return true, nil
+}
 
-	return nil
+// padTo32 left-pads the given byte slice to 32 bytes.
+func padTo32(b []byte) []byte {
+	if len(b) >= 32 {
+		return b[len(b)-32:]
+	}
+	out := make([]byte, 32)
+	copy(out[32-len(b):], b)
+	return out
 }
