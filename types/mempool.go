@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Dev: KryperAI
+// Dev: KryperAI Final Mempool
 
 package types
 
@@ -11,22 +11,20 @@ import (
 )
 
 type Mempool struct {
-	mu        sync.RWMutex
-	pending   []*Transaction
-	state     *StateDB
-	maxSize   int
+	mu      sync.RWMutex
+	pending []*Transaction
+	state   *StateDB
+	maxSize int
 }
 
-// NewMempool initializes mempool
 func NewMempool(state *StateDB) *Mempool {
 	return &Mempool{
 		state:   state,
-		maxSize: 5000, // anti spam
+		maxSize: 5000,
 		pending: make([]*Transaction, 0),
 	}
 }
 
-// AddTx verifies + stores tx
 func (m *Mempool) AddTx(tx *Transaction) error {
 	if tx == nil {
 		return errors.New("nil tx")
@@ -35,27 +33,35 @@ func (m *Mempool) AddTx(tx *Transaction) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Verify signature before anything
-	from, err := VerifyTxSignature(tx)
+	// Detect duplicate
+	txHash := tx.Hash()
+	for _, t := range m.pending {
+		if t.Hash() == txHash {
+			return errors.New("duplicate transaction")
+		}
+	}
+
+	// Recover signer = signature verification
+	from, err := RecoverTxSender(tx)
 	if err != nil {
 		return errors.New("invalid signature")
 	}
 
-	// Balance check for gas
-	required := new(big.Int).Mul(new(big.Int).SetUint64(tx.GasLimit), tx.GasPrice)
-	totalCost := new(big.Int).Add(required, tx.Value)
+	// Balance check
+	gasCost := new(big.Int).Mul(new(big.Int).SetUint64(tx.GasLimit), tx.GasPrice)
+	totalCost := new(big.Int).Add(tx.Value, gasCost)
 
 	if m.state.GetBalance(from).Cmp(totalCost) < 0 {
-		return errors.New("insufficient balance for tx + gas")
+		return errors.New("insufficient balance")
 	}
 
 	// Nonce check
 	currentNonce := m.state.GetNonce(from)
 	if tx.Nonce < currentNonce {
-		return errors.New("nonce too low (replay suspected)")
+		return errors.New("nonce too low")
 	}
 
-	// Max size protection
+	// Anti-spam full pool
 	if len(m.pending) >= m.maxSize {
 		m.evictLowestGas()
 	}
@@ -64,7 +70,6 @@ func (m *Mempool) AddTx(tx *Transaction) error {
 	return nil
 }
 
-// PopForBlock returns N best txs by GasPrice and removes them
 func (m *Mempool) PopForBlock(n int) []*Transaction {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -73,7 +78,6 @@ func (m *Mempool) PopForBlock(n int) []*Transaction {
 		return nil
 	}
 
-	// Highest gas first
 	sort.Slice(m.pending, func(i, j int) bool {
 		return m.pending[i].GasPrice.Cmp(m.pending[j].GasPrice) > 0
 	})
@@ -83,12 +87,11 @@ func (m *Mempool) PopForBlock(n int) []*Transaction {
 	}
 
 	selected := m.pending[:n]
-	m.pending = m.pending[n:] // remove from pool
+	m.pending = m.pending[n:]
 
 	return selected
 }
 
-// Drop tx with lowest gas when pool full
 func (m *Mempool) evictLowestGas() {
 	if len(m.pending) == 0 {
 		return
@@ -99,7 +102,6 @@ func (m *Mempool) evictLowestGas() {
 	m.pending = m.pending[1:]
 }
 
-// Count returns pending size
 func (m *Mempool) Count() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
