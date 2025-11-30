@@ -4,204 +4,125 @@
 package rpc
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
-	"strings"
 
 	"krypper-chain/node"
 	"krypper-chain/types"
 )
 
-// Server wraps HTTP handlers around a running node.
 type Server struct {
 	node *node.Node
 }
 
-// NewServer creates a new RPC server.
 func NewServer(n *node.Node) *Server {
-	return &Server{
-		node: n,
-	}
+	return &Server{node: n}
 }
 
-// Start begins listening on the given address.
 func (s *Server) Start(addr string) error {
 	mux := http.NewServeMux()
 
+	// Public RPC
 	mux.HandleFunc("/tx/send", s.handleSendTx)
-	mux.HandleFunc("/account/balance", s.handleAccountBalance)
-	mux.HandleFunc("/chain/head", s.handleChainHead)
+	mux.HandleFunc("/account/balance", s.handleBalance)
+	mux.HandleFunc("/chain/head", s.handleHead)
 
-	// tier-3 witness endpoint
+	// Validator / Witness
 	mux.HandleFunc("/witness/submit", s.handleSubmitWitness)
+	mux.HandleFunc("/validator/vote", s.handleSubmitVote)
 
+	log.Println("RPC Active", addr)
 	return http.ListenAndServe(addr, mux)
 }
 
-// -------------------------
-// /tx/send
-// -------------------------
-
+// ============ TX SUBMIT ============
 func (s *Server) handleSendTx(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "POST only", 405)
 		return
 	}
 
 	var tx types.Transaction
 	if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+		http.Error(w, "invalid json", 400)
 		return
 	}
 
-	if err := tx.ValidateBasic(); err != nil {
-		http.Error(w, "invalid tx: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// optional: verify signature and recover sender
-	if _, err := types.RecoverTxSender(&tx); err != nil {
-		http.Error(w, "invalid signature", http.StatusBadRequest)
+	// REAL METHOD WE HAVE IN SYSTEM ✔
+	from, err := types.RecoverTxSender(&tx)
+	if err != nil {
+		http.Error(w, "invalid signature", 400)
 		return
 	}
 
 	if err := s.node.Mempool.AddTx(&tx); err != nil {
-		http.Error(w, "mempool reject: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), 400)
 		return
 	}
 
-	resp := map[string]any{
-		"hash": tx.Hash().String(),
-	}
-	writeJSON(w, resp)
+	log.Printf("TX ACCEPTED [%s → %s]\n", from.String(), tx.To.String())
+
+	json.NewEncoder(w).Encode(map[string]any{
+		"status": "accepted",
+		"from":   from.String(),
+		"to":     tx.To.String(),
+		"hash":   tx.Hash().String(),
+	})
 }
 
-// -------------------------
-// /account/balance
-// -------------------------
-
-func (s *Server) handleAccountBalance(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	addrStr := r.URL.Query().Get("address")
-	if addrStr == "" {
-		http.Error(w, "missing address", http.StatusBadRequest)
-		return
-	}
-
-	addr, err := parseAddress(addrStr)
-	if err != nil {
-		http.Error(w, "invalid address", http.StatusBadRequest)
-		return
-	}
+// ============ ACCOUNT =============
+func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
+	addrHex := r.URL.Query().Get("address")
+	addr, _ := types.ParseAddress(addrHex)
 
 	bal := s.node.State.GetBalance(addr)
 	nonce := s.node.State.GetNonce(addr)
 
-	resp := map[string]any{
+	json.NewEncoder(w).Encode(map[string]any{
 		"address": addr.String(),
 		"balance": bal.String(),
 		"nonce":   nonce,
-	}
-	writeJSON(w, resp)
+	})
 }
 
-// -------------------------
-// /chain/head
-// -------------------------
+// ============ HEAD =============
+func (s *Server) handleHead(w http.ResponseWriter, r *http.Request) {
+	h := s.node.Chain.Head()
 
-func (s *Server) handleChainHead(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	head := s.node.Chain.Head()
-	if head == nil {
-		http.Error(w, "no head block", http.StatusNotFound)
-		return
-	}
-
-	hdr := head.Header
-	resp := map[string]any{
-		"height":      hdr.Height,
-		"hash":        head.Hash().String(),
-		"parentHash":  hdr.ParentHash.String(),
-		"stateRoot":   hdr.StateRoot.String(),
-		"txRoot":      hdr.TxRoot.String(),
-		"timestamp":   hdr.Timestamp,
-		"proposer":    hdr.Proposer.String(),
-		"witness":     hdr.Witness.String(),
-		"gasLimit":    hdr.GasLimit,
-		"gasUsed":     hdr.GasUsed,
-	}
-	writeJSON(w, resp)
+	json.NewEncoder(w).Encode(map[string]any{
+		"height": h.Header.Height,
+		"hash":   h.Hash().String(),
+	})
 }
 
-// -------------------------
-// /witness/submit
-// -------------------------
-
+// ============ WITNESS =============
 func (s *Server) handleSubmitWitness(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	var wtx types.Witness
+	if err := json.NewDecoder(r.Body).Decode(&wtx); err != nil {
+		http.Error(w, "invalid witness json", 400)
 		return
 	}
 
-	var wt types.Witness
-	if err := json.NewDecoder(r.Body).Decode(&wt); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
+	s.node.AddWitness(wtx)
 
-	// TODO: signature validation for witness:
-	// - verify that wt.Signature is a valid signature over wt.Hash by wt.Address
-	// This requires a helper in types/crypto.go (e.g. VerifyWitness).
-
-	s.node.AddWitness(wt)
-
-	log.Printf("RPC: witness stored addr=%s height=%d\n", wt.Address.String(), wt.BlockHeight)
-
-	resp := map[string]any{
+	json.NewEncoder(w).Encode(map[string]any{
 		"stored":  true,
-		"height":  wt.BlockHeight,
-		"address": wt.Address.String(),
-	}
-	writeJSON(w, resp)
+		"address": wtx.Address.String(),
+	})
 }
 
-// -------------------------
-// helpers
-// -------------------------
-
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Println("RPC: write json error:", err)
-	}
-}
-
-func parseAddress(s string) (types.Address, error) {
-	var addr types.Address
-
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return addr, nil
+// ============ VALIDATOR =============
+func (s *Server) handleSubmitVote(w http.ResponseWriter, r *http.Request) {
+	var vote types.ValidatorVote
+	if err := json.NewDecoder(r.Body).Decode(&vote); err != nil {
+		http.Error(w, "invalid vote json", 400)
+		return
 	}
 
-	s = strings.TrimPrefix(s, "0x")
-	b, err := hex.DecodeString(s)
-	if err != nil {
-		return addr, err
-	}
-	if len(b) != len(addr) {
-		return addr, nil
-	}
-	copy(addr[:], b)
-	return addr, nil
+	s.node.AddValidatorVote(vote)
+
+	json.NewEncoder(w).Encode(map[string]any{
+		"accepted": true,
+	})
 }
