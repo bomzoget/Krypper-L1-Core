@@ -12,14 +12,16 @@ import (
 	"sync"
 )
 
+// StateDB is an in-memory world state for KRYPPER L1.
+// It supports snapshot/revert and deterministic root hashing.
 type StateDB struct {
-	mu            sync.RWMutex
-	accounts      map[Address]*Account
-	snapshots     map[uint64]map[Address]*Account
-	nextSnapshot  uint64
+	mu        sync.RWMutex
+	accounts  map[Address]*Account
+	snapshotID uint64
+	snapshots map[uint64]map[Address]*Account
 }
 
-// NewStateDB creates a new empty state database.
+// Constructor
 func NewStateDB() *StateDB {
 	return &StateDB{
 		accounts:  make(map[Address]*Account),
@@ -27,8 +29,9 @@ func NewStateDB() *StateDB {
 	}
 }
 
-// internal: caller must hold lock.
-func (s *StateDB) getOrCreate(addr Address) *Account {
+// =============== ACCOUNT ACCESS LAYER ===============
+
+func (s *StateDB) getInternal(addr Address) *Account {
 	acc, ok := s.accounts[addr]
 	if !ok {
 		acc = NewAccount(addr)
@@ -37,155 +40,130 @@ func (s *StateDB) getOrCreate(addr Address) *Account {
 	return acc
 }
 
-// GetAccount returns a copy for read-only usage.
 func (s *StateDB) GetAccount(addr Address) *Account {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+	s.mu.RLock(); defer s.mu.RUnlock()
 	acc, ok := s.accounts[addr]
-	if !ok {
-		return NewAccount(addr)
-	}
+	if !ok { return NewAccount(addr) }
 	return acc.Copy()
 }
 
-// AddBalance adds amount to an address balance.
-func (s *StateDB) AddBalance(addr Address, amount *big.Int) error {
-	if amount == nil || amount.Sign() < 0 {
-		return errors.New("amount must be non-negative")
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	acc := s.getOrCreate(addr)
-	return acc.AddBalance(amount)
-}
-
-// SubBalance subtracts amount from an address balance.
-func (s *StateDB) SubBalance(addr Address, amount *big.Int) error {
-	if amount == nil || amount.Sign() < 0 {
-		return errors.New("amount must be non-negative")
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	acc := s.getOrCreate(addr)
-	return acc.SubBalance(amount)
-}
-
-// IncrementNonce increments account nonce.
-func (s *StateDB) IncrementNonce(addr Address) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	acc := s.getOrCreate(addr)
-	return acc.IncrementNonce()
-}
-
-// SetAccount overwrites the state for an address.
 func (s *StateDB) SetAccount(acc *Account) error {
-	if acc == nil {
-		return errors.New("nil account")
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	copyAcc := acc.Copy()
-	s.accounts[copyAcc.Address] = copyAcc
+	if acc == nil { return errors.New("nil account") }
+	s.mu.Lock(); defer s.mu.Unlock()
+	s.accounts[acc.Address] = acc.Copy()
 	return nil
 }
 
-// Snapshot creates a deep copy snapshot and returns its id.
+// =============== BALANCE / NONCE MUTATION ===============
+
+func (s *StateDB) AddBalance(addr Address, amount *big.Int) error {
+	if amount == nil || amount.Sign() < 0 { return errors.New("amount must be non-negative") }
+	s.mu.Lock(); defer s.mu.Unlock()
+	return s.getInternal(addr).AddBalance(amount)
+}
+
+func (s *StateDB) SubBalance(addr Address, amount *big.Int) error {
+	if amount == nil || amount.Sign() < 0 { return errors.New("amount must be non-negative") }
+	s.mu.Lock(); defer s.mu.Unlock()
+	return s.getInternal(addr).SubBalance(amount)
+}
+
+func (s *StateDB) IncrementNonce(addr Address) error {
+	s.mu.Lock(); defer s.mu.Unlock()
+	return s.getInternal(addr).IncrementNonce()
+}
+
+// =============== SNAPSHOT / ROLLBACK ENGINE ===============
+
 func (s *StateDB) Snapshot() uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.RLock(); defer s.mu.RUnlock()
 
-	id := s.nextSnapshot
-	s.nextSnapshot++
+	s.snapshotID++
+	id := s.snapshotID
 
-	snap := make(map[Address]*Account, len(s.accounts))
-	for addr, acc := range s.accounts {
-		snap[addr] = acc.Copy()
+	cp := make(map[Address]*Account, len(s.accounts))
+	for a, acc := range s.accounts {
+		cp[a] = acc.Copy()
 	}
-
-	s.snapshots[id] = snap
+	s.snapshots[id] = cp
 	return id
 }
 
-// RevertToSnapshot restores the state to a previous snapshot.
 func (s *StateDB) RevertToSnapshot(id uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.Lock(); defer s.mu.Unlock()
 
 	snap, ok := s.snapshots[id]
-	if !ok {
-		return
-	}
+	if !ok { return }
 
 	restore := make(map[Address]*Account, len(snap))
-	for addr, acc := range snap {
-		restore[addr] = acc.Copy()
+	for a, acc := range snap {
+		restore[a] = acc.Copy()
 	}
-
 	s.accounts = restore
-
-	// optional: cleanup snapshot
 	delete(s.snapshots, id)
 }
 
-// StateRoot computes a deterministic hash of all accounts.
-func (s *StateDB) StateRoot() Hash {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *StateDB) CommitSnapshot(id uint64) {
+	s.mu.Lock(); defer s.mu.Unlock()
+	delete(s.snapshots, id)
+}
 
-	if len(s.accounts) == 0 {
-		return ZeroHash()
-	}
+// =============== STATE ROOT / MERKLE TREE ===============
+
+func (s *StateDB) StateRoot() Hash {
+	s.mu.RLock(); defer s.mu.RUnlock()
+
+	if len(s.accounts) == 0 { return ZeroHash() }
 
 	addrs := make([]Address, 0, len(s.accounts))
-	for addr := range s.accounts {
-		addrs = append(addrs, addr)
-	}
+	for a := range s.accounts { addrs = append(addrs, a) }
 
 	sort.Slice(addrs, func(i, j int) bool {
 		return bytes.Compare(addrs[i][:], addrs[j][:]) < 0
 	})
 
-	leaves := make([]Hash, 0, len(addrs))
-	for _, addr := range addrs {
-		acc := s.accounts[addr]
-		h := sha256.Sum256(append(addr[:], acc.Hash()[:]...))
-		leaves = append(leaves, Hash(h))
+	leaves := make([]Hash, len(addrs))
+	for i, a := range addrs {
+		h := sha256.Sum256(append(a[:], s.accounts[a].Hash()[:]...))
+		leaves[i] = Hash(h)
 	}
 
 	return merkleFromHashes(leaves)
 }
 
-func merkleFromHashes(leaves []Hash) Hash {
-	if len(leaves) == 0 {
-		return ZeroHash()
-	}
-	if len(leaves) == 1 {
-		return leaves[0]
-	}
+func merkleFromHashes(h []Hash) Hash {
+	if len(h) == 0 { return ZeroHash() }
+	if len(h) == 1 { return h[0] }
 
-	hashes := make([]Hash, len(leaves))
-	copy(hashes, leaves)
-
-	for len(hashes) > 1 {
-		if len(hashes)%2 != 0 {
-			hashes = append(hashes, hashes[len(hashes)-1])
+	for len(h) > 1 {
+		if len(h)%2 != 0 { h = append(h, h[len(h)-1]) }
+		next := make([]Hash, 0, len(h)/2)
+		for i := 0; i < len(h); i += 2 {
+			s := sha256.Sum256(append(h[i][:], h[i+1][:]...))
+			next = append(next, Hash(s))
 		}
-		next := make([]Hash, 0, len(hashes)/2)
-		for i := 0; i < len(hashes); i += 2 {
-			sum := sha256.Sum256(append(hashes[i][:], hashes[i+1][:]...))
-			next = append(next, Hash(sum))
-		}
-		hashes = next
+		h = next
 	}
+	return h[0]
+}
 
-	return hashes[0]
+// =============== PUBLIC READ HELPERS ===============
+
+func (s *StateDB) GetBalance(addr Address) *big.Int {
+	s.mu.RLock(); defer s.mu.RUnlock()
+	acc, ok := s.accounts[addr]
+	if !ok { return big.NewInt(0) }
+	return new(big.Int).Set(acc.Balance)
+}
+
+func (s *StateDB) GetNonce(addr Address) uint64 {
+	s.mu.RLock(); defer s.mu.RUnlock()
+	acc, ok := s.accounts[addr]
+	if !ok { return 0 }
+	return acc.Nonce
+}
+
+// Mint is explicit inflation (used by rewards, consensus).
+func (s *StateDB) Mint(addr Address, amount *big.Int) error {
+	return s.AddBalance(addr, amount)
 }
