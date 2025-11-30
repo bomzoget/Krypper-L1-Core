@@ -4,81 +4,104 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"math/big"
-	"time"
+	"strings"
 
 	"krypper-chain/node"
+	"krypper-chain/p2p"
 	"krypper-chain/rpc"
 	"krypper-chain/types"
 )
 
 func main() {
-	fmt.Println("=== KRYPPER L1 NODE BOOT ===")
+	// Command args
+	rpcPort := flag.String("port", "8545", "RPC port")
+	peerList := flag.String("peers", "", "Comma separated peer URLs")
+	flag.Parse()
 
-	// Core = State + Mempool
+	fmt.Println("=== KRYPPER NODE START ===")
+
+	// Core system
 	state := types.NewStateDB()
 	mempool := types.NewMempool(state)
 
-	// Tier1 Miner Wallet
+	// Miner identity (unique per node)
 	minerKey, minerAddr, _ := types.GenerateKey()
-	fmt.Println("Miner Address:", minerAddr.String())
+	fmt.Println("Miner:", minerAddr.String())
 
-	// Reward Pool Address
-	var poolAddr types.Address
-	poolAddr[0] = 0x99
+	// Trinity economy config
+	var rewardPool types.Address
+	rewardPool[0] = 0xAA
 
-	// Trinity Reward Distribution
 	cfg := types.ChainConfig{
 		ChainID:    1,
-		RewardPool: poolAddr,
-
+		RewardPool: rewardPool,
 		ShareTier1: 70,
 		ShareTier2: 20,
 		ShareTier3: 5,
 		SharePool:  5,
 	}
 
-	// Connect Engine
 	exec := types.NewExecutor(state, cfg)
 	chain := types.NewBlockchain(state, exec)
 
-	// ========== GENESIS BLOCK ==========
-	genesisAmount := new(big.Int).Mul(big.NewInt(1_000_000), big.NewInt(1e18))
-	_ = state.AddBalance(minerAddr, genesisAmount)
+	// ------------------------------
+	// DETERMINISTIC GENESIS
+	// ------------------------------
+
+	var gAddress types.Address
+	gAddress[0] = 0x11 // fixed genesis holder
+
+	amount := new(big.Int).Mul(big.NewInt(1_000_000), big.NewInt(1e18))
+	state.Mint(gAddress, amount)
 
 	genHeader := &types.BlockHeader{
-		ParentHash: types.ZeroHash(), // FIXED
+		ParentHash: types.ZeroHash(),
 		Height:     0,
-		Timestamp:  time.Now().Unix(),
+		Timestamp:  1700000000, // fixed time + reproducible
 		StateRoot:  state.StateRoot(),
-		TxRoot:     types.ZeroHash(), // FIXED
+		TxRoot:     types.ZeroHash(),
 		GasLimit:   30_000_000,
-		Proposer:   minerAddr,
+		Proposer:   gAddress,
 	}
 
 	genesis := types.NewBlock(genHeader, []*types.Transaction{})
-
 	if err := chain.AddBlock(genesis); err != nil {
-		log.Fatalf("GENESIS FAILED: %v", err)
+		log.Fatal("GENESIS:", err)
 	}
-	fmt.Println("GENESIS OK — HEIGHT =", chain.Head().Header.Height)
 
-	// Start Node (Auto-Mining)
-	n := node.NewNode(chain, state, mempool, exec, minerAddr)
-	n.BlockTime = 5 * time.Second
+	fmt.Println("GENESIS OK:", genesis.Hash())
+
+	// ------------------------------
+	// P2P
+	// ------------------------------
+	peers := []string{}
+	if *peerList != "" {
+		peers = strings.Split(*peerList, ",")
+	}
+	p2pManager := p2p.NewManager(peers)
+
+	// ------------------------------
+	// NODE
+	// ------------------------------
+	n := node.NewNode(chain, state, mempool, exec, minerAddr, p2pManager)
 	n.Start()
 
-	// RPC API ENABLED
-	srv := rpc.NewServer(n)
+	// ------------------------------
+	// RPC
+	// ------------------------------
+	server := rpc.NewServer(n)
 	go func() {
-		fmt.Println("RPC LISTEN → :8545")
-		if err := srv.Start(":8545"); err != nil {
-			log.Fatalf("RPC ERROR: %v", err)
+		addr := ":" + *rpcPort
+		fmt.Println("RPC:", addr)
+		if err := server.Start(addr); err != nil {
+			log.Fatal(err)
 		}
 	}()
 
-	fmt.Println("NODE ACTIVE — MINING LIVE — RPC READY")
-	select {} // infinite run
+	fmt.Println("NODE RUNNING")
+	select {}
 }
