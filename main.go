@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Dev: KryperAI
+
 package main
 
 import (
@@ -6,108 +9,76 @@ import (
 	"math/big"
 	"time"
 
+	"krypper-chain/node"
+	"krypper-chain/rpc"
 	"krypper-chain/types"
 )
 
 func main() {
-	fmt.Println("Launching KRYPPER Node Simulation...")
+	fmt.Println("=== KRYPPER L1 NODE BOOT ===")
 
-	// Core components
+	// Core = State + Mempool
 	state := types.NewStateDB()
 	mempool := types.NewMempool(state)
 
+	// Tier1 Miner Wallet
 	minerKey, minerAddr, _ := types.GenerateKey()
-	poolAddr := types.Address{0x99}
+	fmt.Println("Miner Address:", minerAddr.String())
 
-	config := types.ChainConfig{
-		ChainID:        1,
-		Coinbase:       minerAddr,
-		RewardPoolAddr: poolAddr,
-		PoolShare:      10,
+	// Reward Pool Address
+	var poolAddr types.Address
+	poolAddr[0] = 0x99
+
+	// Trinity Reward Distribution
+	cfg := types.ChainConfig{
+		ChainID:    1,
+		RewardPool: poolAddr,
+
+		ShareTier1: 70,
+		ShareTier2: 20,
+		ShareTier3: 5,
+		SharePool:  5,
 	}
 
-	executor := types.NewExecutor(state, config)
-	chain := types.NewBlockchain(state, executor)
+	// Connect Engine
+	exec := types.NewExecutor(state, cfg)
+	chain := types.NewBlockchain(state, exec)
 
-	fmt.Println("Miner Address:", minerAddr)
-	fmt.Println("Fee Reserve Pool:", poolAddr)
+	// ========== GENESIS BLOCK ==========
+	genesisAmount := new(big.Int).Mul(big.NewInt(1_000_000), big.NewInt(1e18))
+	_ = state.AddBalance(minerAddr, genesisAmount)
 
-	// ---------------- GENESIS ---------------- //
-	genesisFund := new(big.Int).Mul(big.NewInt(1_000_000), big.NewInt(1e18))
-	state.Mint(minerAddr, genesisFund)
-
-	gHeader := types.BlockHeader{
-		Height:    0,
-		Timestamp: time.Now().Unix(),
-		StateRoot: state.StateRoot(),
-		Proposer:  minerAddr,
-		GasLimit:  30_000_000,
+	genHeader := &types.BlockHeader{
+		ParentHash: types.ZeroHash(), // FIXED
+		Height:     0,
+		Timestamp:  time.Now().Unix(),
+		StateRoot:  state.StateRoot(),
+		TxRoot:     types.ZeroHash(), // FIXED
+		GasLimit:   30_000_000,
+		Proposer:   minerAddr,
 	}
 
-	genesis := types.NewBlock(gHeader, []*types.Transaction{})
-	genesis.ComputeTxRoot()
+	genesis := types.NewBlock(genHeader, []*types.Transaction{})
 
 	if err := chain.AddBlock(genesis); err != nil {
-		log.Fatal("GENESIS FAILED:", err)
-	} else {
-		fmt.Println("GENESIS COMMITTED")
+		log.Fatalf("GENESIS FAILED: %v", err)
 	}
+	fmt.Println("GENESIS OK — HEIGHT =", chain.Head().Header.Height)
 
-	// -------------- TX GENERATION -------------- //
-	userKey, userAddr, _ := types.GenerateKey()
+	// Start Node (Auto-Mining)
+	n := node.NewNode(chain, state, mempool, exec, minerAddr)
+	n.BlockTime = 5 * time.Second
+	n.Start()
 
-	for i := 0; i < 5; i++ {
-		value := new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18))
-		gasPrice := big.NewInt(int64(1_000_000_000 + (i * 200_000)))
-
-		nonce := state.GetNonce(minerAddr)
-		tx := types.NewTransferTx(1, nonce+uint64(i), userAddr, value, gasPrice, 21000, nil)
-
-		if err := types.SignTransaction(tx, minerKey); err != nil {
-			log.Fatal("SIGN ERROR:", err)
+	// RPC API ENABLED
+	srv := rpc.NewServer(n)
+	go func() {
+		fmt.Println("RPC LISTEN → :8545")
+		if err := srv.Start(":8545"); err != nil {
+			log.Fatalf("RPC ERROR: %v", err)
 		}
-		if err := mempool.AddTx(tx); err != nil {
-			log.Println("TX REJECTED →", err)
-		}
-	}
+	}()
 
-	fmt.Println("Mempool Size:", mempool.Count())
-
-	// -------------- BLOCK MINING -------------- //
-	fmt.Println("Mining Block #1...")
-
-	selected := mempool.PopForBlock(3)
-	snap := state.Snapshot()
-
-	for _, tx := range selected {
-		executor.SetCoinbase(minerAddr)
-		executor.ExecuteTx(tx)
-	}
-
-	newRoot := state.StateRoot()
-	state.RevertToSnapshot(snap)
-
-	b1 := types.BlockHeader{
-		ParentHash: genesis.Hash(),
-		Height:     1,
-		Timestamp:  time.Now().Unix(),
-		StateRoot:  newRoot,
-		Proposer:   minerAddr,
-		GasLimit:   30_000_000,
-	}
-	block1 := types.NewBlock(b1, selected)
-	block1.ComputeTxRoot()
-
-	if err := chain.AddBlock(block1); err != nil {
-		log.Fatal("BLOCK1 REJECTED:", err)
-	} else {
-		fmt.Println("BLOCK1 ACCEPTED")
-	}
-
-	// ----------- FINAL INFO ----------- //
-	fmt.Println("Final State:")
-	fmt.Println("User Balance:", state.GetBalance(userAddr))
-	fmt.Println("Miner Balance:", state.GetBalance(minerAddr))
-	fmt.Println("Reward Pool:", state.GetBalance(poolAddr))
-	fmt.Println("Chain Height:", chain.Head().Header.Height)
+	fmt.Println("NODE ACTIVE — MINING LIVE — RPC READY")
+	select {} // infinite run
 }
