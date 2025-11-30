@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
@@ -17,346 +18,260 @@ import (
 )
 
 type Server struct {
-	Node *node.Node
+	node *node.Node
+	mux  *http.ServeMux
 }
 
 func NewServer(n *node.Node) *Server {
-	return &Server{Node: n}
+	s := &Server{
+		node: n,
+		mux:  http.NewServeMux(),
+	}
+	s.routes()
+	return s
 }
 
 func (s *Server) Start(addr string) error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/tx/send", s.handleSendTx)
-	mux.HandleFunc("/account/", s.handleAccount)
-	mux.HandleFunc("/chain/head", s.handleHead)
-	mux.HandleFunc("/mempool/info", s.handleMempoolInfo)
-
-	// p2p endpoints for internal gossip
-	mux.HandleFunc("/p2p/tx", s.handleP2PTx)
-	mux.HandleFunc("/p2p/block", s.handleP2PBlock)
-
-	log.Printf("rpc: listening on %s\n", addr)
-	return http.ListenAndServe(addr, mux)
+	return http.ListenAndServe(addr, s.mux)
 }
 
-// ------------------------------------------------------------------
-// Models
-// ------------------------------------------------------------------
+func (s *Server) routes() {
+	s.mux.HandleFunc("/health", s.handleHealth)
+	s.mux.HandleFunc("/chain/head", s.handleChainHead)
+	s.mux.HandleFunc("/account/balance", s.handleAccountBalance)
+	s.mux.HandleFunc("/tx/send", s.handleSendTx)
 
-type sendTxRequest struct {
-	ChainID  string `json:"chainId"`
-	Nonce    uint64 `json:"nonce"`
-	To       string `json:"to"`
-	Value    string `json:"value"`
-	GasPrice string `json:"gasPrice"`
-	GasLimit uint64 `json:"gasLimit"`
-	Data     string `json:"data"`
-	R        string `json:"r"`
-	S        string `json:"s"`
-	V        uint8  `json:"v"`
+	// P2P ingress endpoints (used by other nodes)
+	s.mux.HandleFunc("/p2p/tx", s.handleP2PTx)
+	s.mux.HandleFunc("/p2p/block", s.handleP2PBlock)
 }
 
-type sendTxResponse struct {
-	TxHash string `json:"txHash"`
-	Status string `json:"status"`
-	Error  string `json:"error,omitempty"`
-}
+// -------------------- basic handlers --------------------
 
-type accountResponse struct {
-	Address string `json:"address"`
-	Balance string `json:"balance"`
-	Nonce   uint64 `json:"nonce"`
-}
-
-// ------------------------------------------------------------------
-// Public Handlers
-// ------------------------------------------------------------------
-
-func (s *Server) handleSendTx(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-
-	var req sendTxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	chainID, err := parseBig(req.ChainID)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid chainId")
-		return
-	}
-
-	to, err := parseAddress(req.To)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid to address")
-		return
-	}
-
-	value, err := parseBig(req.Value)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid value")
-		return
-	}
-
-	gasPrice, err := parseBig(req.GasPrice)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid gasPrice")
-		return
-	}
-
-	data, err := parseHexBytes(req.Data)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid data hex")
-		return
-	}
-
-	rBig, err := parseBigHex(req.R)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid r")
-		return
-	}
-
-	sBig, err := parseBigHex(req.S)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid s")
-		return
-	}
-
-	tx := &types.Transaction{
-		ChainId:  chainID,
-		Type:     types.TxTypeTransfer,
-		Nonce:    req.Nonce,
-		To:       to,
-		Value:    value,
-		GasPrice: gasPrice,
-		GasLimit: req.GasLimit,
-		Data:     data,
-		Signature: types.Signature{
-			R: rBig,
-			S: sBig,
-			V: req.V,
-		},
-	}
-
-	if err := tx.ValidateBasic(); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid tx: "+err.Error())
-		return
-	}
-
-	if err := s.Node.Mempool.AddTx(tx); err != nil {
-		writeJSON(w, http.StatusOK, sendTxResponse{
-			TxHash: tx.Hash().String(),
-			Status: "rejected",
-			Error:  err.Error(),
-		})
-		return
-	}
-
-	// relay to peers
-	s.Node.BroadcastTx(tx)
-
-	writeJSON(w, http.StatusOK, sendTxResponse{
-		TxHash: tx.Hash().String(),
-		Status: "accepted",
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok",
 	})
 }
 
-func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleChainHead(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		httpError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	path := strings.TrimPrefix(r.URL.Path, "/account/")
-	if path == "" {
-		writeError(w, http.StatusBadRequest, "missing address")
+	head := s.node.Chain.Head()
+	if head == nil {
+		httpError(w, http.StatusNotFound, "no blocks yet")
 		return
 	}
 
-	parts := strings.Split(path, "/")
-	addrStr := parts[0]
+	hdr := head.Header
+	writeJSON(w, http.StatusOK, map[string]any{
+		"height":    hdr.Height,
+		"hash":      head.Hash().String(),
+		"stateRoot": hdr.StateRoot.String(),
+		"txCount":   len(head.Transactions),
+		"proposer":  hdr.Proposer.String(),
+	})
+}
+
+func (s *Server) handleAccountBalance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	addrStr := r.URL.Query().Get("address")
+	if addrStr == "" {
+		httpError(w, http.StatusBadRequest, "missing address")
+		return
+	}
 
 	addr, err := parseAddress(addrStr)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid address")
+		httpError(w, http.StatusBadRequest, "invalid address")
 		return
 	}
 
-	acc := s.Node.State.GetAccount(addr)
-	resp := accountResponse{
-		Address: addr.String(),
-		Balance: acc.Balance.String(),
-		Nonce:   acc.Nonce,
-	}
-	writeJSON(w, http.StatusOK, resp)
+	bal := s.node.State.GetBalance(addr)
+	nonce := s.node.State.GetNonce(addr)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"address": addr.String(),
+		"balance": bal.String(),
+		"nonce":   nonce,
+	})
 }
 
-func (s *Server) handleHead(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+// -------------------- TX: external client --------------------
+
+func (s *Server) handleSendTx(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		httpError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	head := s.Node.Chain.Head()
-	if head == nil {
-		writeError(w, http.StatusNotFound, "no head")
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "cannot read body")
+		return
+	}
+	defer r.Body.Close()
+
+	var tx types.Transaction
+	if err := json.Unmarshal(body, &tx); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid tx json")
 		return
 	}
 
-	type headResponse struct {
-		Height    uint64 `json:"height"`
-		Hash      string `json:"hash"`
-		StateRoot string `json:"stateRoot"`
-		TxCount   int    `json:"txCount"`
+	// stateless validation
+	if err := tx.ValidateBasic(); err != nil {
+		httpError(w, http.StatusBadRequest, "tx validation failed: "+err.Error())
+		return
 	}
 
-	resp := headResponse{
-		Height:    head.Header.Height,
-		Hash:      head.Hash().String(),
-		StateRoot: head.Header.StateRoot.String(),
-		TxCount:   len(head.Transactions),
+	// signature + from address
+	from, err := types.RecoverTxSender(&tx)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "invalid signature")
+		return
 	}
-	writeJSON(w, http.StatusOK, resp)
+
+	// sanity check nonce / balance through mempool rules
+	if err := s.node.Mempool.AddTx(&tx); err != nil {
+		httpError(w, http.StatusBadRequest, "mempool reject: "+err.Error())
+		return
+	}
+
+	// broadcast via p2p if available
+	if s.node.P2P != nil {
+		s.node.P2P.BroadcastTx(&tx)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "accepted",
+		"hash":   tx.Hash().String(),
+		"from":   from.String(),
+	})
 }
 
-func (s *Server) handleMempoolInfo(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-
-	type memInfo struct {
-		Pending int `json:"pending"`
-	}
-
-	resp := memInfo{
-		Pending: s.Node.Mempool.Count(),
-	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
-// ------------------------------------------------------------------
-// P2P Handlers (internal node-to-node use)
-// ------------------------------------------------------------------
+// -------------------- P2P ingress: tx/block --------------------
 
 func (s *Server) handleP2PTx(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		httpError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
 	var tx types.Transaction
 	if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+		httpError(w, http.StatusBadRequest, "invalid tx json")
 		return
 	}
+	defer r.Body.Close()
 
 	if err := tx.ValidateBasic(); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid tx: "+err.Error())
+		httpError(w, http.StatusBadRequest, "tx validation failed: "+err.Error())
 		return
 	}
 
-	if err := s.Node.Mempool.AddTx(&tx); err != nil {
-		writeError(w, http.StatusBadRequest, "mempool reject: "+err.Error())
+	if _, err := types.RecoverTxSender(&tx); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid signature")
 		return
 	}
 
-	// do not re-broadcast to avoid infinite loops
-	writeJSON(w, http.StatusOK, map[string]string{
+	// add but do not rebroadcast (avoid loops)
+	if err := s.node.Mempool.AddTx(&tx); err != nil {
+		httpError(w, http.StatusBadRequest, "mempool reject: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok",
 	})
 }
 
 func (s *Server) handleP2PBlock(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		httpError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
 	var b types.Block
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+		httpError(w, http.StatusBadRequest, "invalid block json")
+		return
+	}
+	defer r.Body.Close()
+
+	// re-validate and execute via chain
+	if err := s.node.Chain.AddBlock(&b); err != nil {
+		httpError(w, http.StatusBadRequest, "block rejected: "+err.Error())
 		return
 	}
 
-	if err := s.Node.Chain.AddBlock(&b); err != nil {
-		writeError(w, http.StatusBadRequest, "block reject: "+err.Error())
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{
+	// do not rebroadcast here; only original miner broadcasts
+	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok",
+		"height": b.Header.Height,
+		"hash":   b.Hash().String(),
 	})
 }
 
-// ------------------------------------------------------------------
-// Helpers
-// ------------------------------------------------------------------
-
-func writeError(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{
-		"error": msg,
-	})
-}
+// -------------------- helpers --------------------
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		log.Printf("rpc: write json error: %v\n", err)
+	}
+}
+
+func httpError(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]any{
+		"error": msg,
+	})
 }
 
 func parseAddress(s string) (types.Address, error) {
-	var a types.Address
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "0x")
-	if len(s) != 40 {
-		return a, errors.New("invalid length")
-	}
-	b, err := hex.DecodeString(s)
-	if err != nil {
-		return a, err
-	}
-	copy(a[:], b)
-	return a, nil
-}
+	var zero types.Address
 
-func parseBig(s string) (*big.Int, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return big.NewInt(0), nil
+		return zero, errors.New("empty address")
+	}
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		s = s[2:]
+	}
+	if len(s) != 40 {
+		return zero, errors.New("invalid length")
+	}
+
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return zero, err
+	}
+	copy(zero[:], b)
+	return zero, nil
+}
+
+// Optional helper to parse big-int from string if needed later.
+func parseBigInt(s string) (*big.Int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, errors.New("empty")
 	}
 	n, ok := new(big.Int).SetString(s, 10)
 	if !ok {
 		return nil, errors.New("invalid big int")
 	}
 	return n, nil
-}
-
-func parseHexBytes(s string) ([]byte, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil, nil
-	}
-	s = strings.TrimPrefix(s, "0x")
-	if len(s)%2 != 0 {
-		s = "0" + s
-	}
-	return hex.DecodeString(s)
-}
-
-func parseBigHex(s string) (*big.Int, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return big.NewInt(0), nil
-	}
-	s = strings.TrimPrefix(s, "0x")
-	b, err := hex.DecodeString(s)
-	if err != nil {
-		return nil, err
-	}
-	return new(big.Int).SetBytes(b), nil
 }
