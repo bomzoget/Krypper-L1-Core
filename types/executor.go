@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Dev KryperAI
+// Dev: KryperAI
 
 package types
 
@@ -8,162 +8,129 @@ import (
 	"math/big"
 )
 
-// Receipt describes the result of executing a single transaction.
 type Receipt struct {
-	TxHash  Hash     `json:"txHash"`
-	Success bool     `json:"success"`
-	GasUsed uint64   `json:"gasUsed"`
-	Logs    [][]byte `json:"logs"`
+	TxHash  Hash
+	Success bool
+	GasUsed uint64
+	Logs    [][]byte
 }
 
-// ChainConfig carries execution-time parameters such as fee routing.
+// Tier-based reward config
 type ChainConfig struct {
-	ChainID     uint64  // network chain id, informational here
-	Coinbase    Address // current block producer / miner
-	RewardPool  Address // reserve / buyback pool
-	PoolShare   uint64  // percent of gas fee sent to RewardPool (0-100)
+	ChainID    uint64
+	RewardPool Address
+
+	ShareTier1 uint64 // Proposer
+	ShareTier2 uint64 // Validator
+	ShareTier3 uint64 // Witness
+	SharePool  uint64 // Reserve/Fund
+
+	// % total <= 100 → remainder = auto-burn
 }
 
-// Executor applies transactions to StateDB under a given config.
 type Executor struct {
-	state  *StateDB
-	config ChainConfig
+	state   *StateDB
+	config  ChainConfig
+	current *BlockHeader
 }
 
-// NewExecutor constructs an executor bound to a statedb and config.
 func NewExecutor(state *StateDB, cfg ChainConfig) *Executor {
-	return &Executor{
-		state:  state,
-		config: cfg,
-	}
+	return &Executor{state: state, config: cfg}
 }
 
-// SetCoinbase updates the coinbase address (for new block producer).
-func (e *Executor) SetCoinbase(addr Address) {
-	e.config.Coinbase = addr
-}
+func (e *Executor) SetBlock(h *BlockHeader) { e.current = h }
 
-// ExecuteBlock executes all transactions in a block sequentially.
-// It assumes the caller (Blockchain) wraps this with a higher-level
-// snapshot/revert for the entire block if needed.
+// -------------------------------------------------------------
+
 func (e *Executor) ExecuteBlock(b *Block) ([]*Receipt, error) {
-	if b == nil {
-		return nil, errors.New("nil block")
+	if b == nil || b.Header == nil {
+		return nil, errors.New("invalid block")
 	}
 
-	receipts := make([]*Receipt, 0, len(b.Transactions))
+	e.current = b.Header
+	receipts := make([]*Receipt, len(b.Transactions))
 
-	for _, tx := range b.Transactions {
-		if tx == nil {
-			return receipts, errors.New("nil transaction in block")
-		}
-
-		// Stateless validation (already covered in Block.ValidateBasic but harmless).
-		if err := tx.ValidateBasic(); err != nil {
-			return receipts, err
-		}
-
-		// Execute single transaction.
+	for i, tx := range b.Transactions {
 		r, err := e.ExecuteTx(tx)
 		if err != nil {
-			return receipts, err
+			return receipts[:i], err
 		}
-		receipts = append(receipts, r)
+		receipts[i] = r
 	}
 
 	return receipts, nil
 }
 
-// ExecuteTx executes a single transaction atomically.
-// It uses StateDB snapshot/revert to ensure all-or-nothing semantics.
+// -------------------------------------------------------------
+
 func (e *Executor) ExecuteTx(tx *Transaction) (*Receipt, error) {
 	if tx == nil {
-		return nil, errors.New("nil transaction")
+		return nil, errors.New("nil tx")
 	}
 
-	// Recover or use cached sender.
-	from := tx.GetFrom()
-	if from.IsZero() {
-		addr, err := RecoverTxSender(tx)
-		if err != nil {
-			return nil, err
-		}
-		from = addr
+	from, err := RecoverTxSender(tx)
+	if err != nil {
+		return nil, errors.New("invalid signature")
 	}
 
-	// Check nonce ordering.
-	expectedNonce := e.state.GetNonce(from)
-	if tx.Nonce != expectedNonce {
-		return nil, errors.New("invalid nonce")
-	}
+	snap := e.state.Snapshot() // <- rollback layer
 
-	// Validate gas price.
-	if tx.GasPrice == nil || tx.GasPrice.Sign() < 0 {
-		return nil, errors.New("invalid gasPrice")
-	}
+	fee := new(big.Int).Mul(new(big.Int).SetUint64(tx.GasLimit), tx.GasPrice)
+	total := new(big.Int).Add(tx.Value, fee)
 
-	// Compute gas fee = GasLimit * GasPrice.
-	gasFee := new(big.Int).Mul(new(big.Int).SetUint64(tx.GasLimit), tx.GasPrice)
-
-	// Total cost = value + gas fee.
-	totalCost := new(big.Int).Add(tx.Value, gasFee)
-
-	// Take a snapshot so this tx can be reverted independently.
-	snapID := e.state.Snapshot()
-
-	// 1. Deduct total cost from sender.
-	if err := e.state.SubBalance(from, totalCost); err != nil {
-		e.state.RevertToSnapshot(snapID)
+	if err := e.state.SubBalance(from, total); err != nil {
+		e.state.RevertToSnapshot(snap)
 		return nil, err
 	}
-
-	// 2. Increment nonce.
 	if err := e.state.IncrementNonce(from); err != nil {
-		e.state.RevertToSnapshot(snapID)
+		e.state.RevertToSnapshot(snap)
 		return nil, err
 	}
-
-	// 3. Transfer value to recipient.
-	if tx.Value != nil && tx.Value.Sign() > 0 {
+	if tx.Value.Sign() > 0 {
 		if err := e.state.AddBalance(tx.To, tx.Value); err != nil {
-			e.state.RevertToSnapshot(snapID)
+			e.state.RevertToSnapshot(snap)
 			return nil, err
 		}
 	}
 
-	// 4. Distribute gas fee between reward pool and coinbase.
-	if gasFee.Sign() > 0 {
-		if e.config.PoolShare > 100 {
-			e.state.RevertToSnapshot(snapID)
-			return nil, errors.New("invalid pool share")
-		}
+	// ---------------------------------------------------------
+	// 🔥 Tier reward distribution
+	// ---------------------------------------------------------
+	t1 := calcPct(fee, e.config.ShareTier1)
+	t2 := calcPct(fee, e.config.ShareTier2)
+	t3 := calcPct(fee, e.config.ShareTier3)
+	pfund := calcPct(fee, e.config.SharePool)
 
-		poolAmount := new(big.Int)
-		minerAmount := new(big.Int).Set(gasFee)
-
-		if e.config.PoolShare > 0 {
-			poolAmount.Mul(gasFee, big.NewInt(int64(e.config.PoolShare)))
-			poolAmount.Div(poolAmount, big.NewInt(100))
-			minerAmount.Sub(gasFee, poolAmount)
-		}
-
-		if poolAmount.Sign() > 0 {
-			_ = e.state.AddBalance(e.config.RewardPool, poolAmount)
-		}
-		if minerAmount.Sign() > 0 {
-			_ = e.state.AddBalance(e.config.Coinbase, minerAmount)
-		}
+	if t1.Sign() > 0 && !e.current.Proposer.IsZero() {
+		e.state.AddBalance(e.current.Proposer, t1)
+	}
+	if t2.Sign() > 0 && !e.current.Validator.IsZero() {
+		e.state.AddBalance(e.current.Validator, t2)
+	}
+	if t3.Sign() > 0 && !e.current.Witness.IsZero() {
+		e.state.AddBalance(e.current.Witness, t3)
+	}
+	if pfund.Sign() > 0 {
+		e.state.AddBalance(e.config.RewardPool, pfund)
 	}
 
-	// Commit tx snapshot; state is now permanent for this tx.
-	e.state.CommitSnapshot(snapID)
+	// ---------------------------------------------------------
+	// 🧹 Important fix → clear snapshot (prevent RAM leak)
+	// ---------------------------------------------------------
+	e.state.CommitSnapshot(snap)
 
-	receipt := &Receipt{
+	return &Receipt{
 		TxHash:  tx.Hash(),
 		Success: true,
-		GasUsed: tx.GasLimit, // placeholder: full gas limit; real VM would track actual used gas.
-		Logs:    [][]byte{},
-	}
+		GasUsed: tx.GasLimit,
+		Logs:    nil,
+	}, nil
+}
 
-	return receipt, nil
+func calcPct(base *big.Int, pct uint64) *big.Int {
+	if pct == 0 {
+		return big.NewInt(0)
+	}
+	out := new(big.Int).Mul(base, new(big.Int).SetUint64(pct))
+	return out.Div(out, big.NewInt(100))
 }
