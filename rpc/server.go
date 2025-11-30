@@ -1,68 +1,207 @@
 // SPDX-License-Identifier: MIT
-// Dev: KrypperAI
+// Dev: KryperAI
 
 package rpc
 
 import (
+	"encoding/hex"
 	"encoding/json"
-	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"krypper-chain/node"
 	"krypper-chain/types"
 )
 
-type Server struct{ n *node.Node }
+// Server wraps HTTP handlers around a running node.
+type Server struct {
+	node *node.Node
+}
 
-func NewServer(n *node.Node)*Server{ return &Server{n:n} }
+// NewServer creates a new RPC server.
+func NewServer(n *node.Node) *Server {
+	return &Server{
+		node: n,
+	}
+}
 
+// Start begins listening on the given address.
 func (s *Server) Start(addr string) error {
-	http.HandleFunc("/tx/send", s.handleSendTx)
-	http.HandleFunc("/account/balance", s.handleBalance)
-	http.HandleFunc("/chain/head", s.handleHead)
-	return http.ListenAndServe(addr,nil)
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/tx/send", s.handleSendTx)
+	mux.HandleFunc("/account/balance", s.handleAccountBalance)
+	mux.HandleFunc("/chain/head", s.handleChainHead)
+
+	// tier-3 witness endpoint
+	mux.HandleFunc("/witness/submit", s.handleSubmitWitness)
+
+	return http.ListenAndServe(addr, mux)
 }
 
-func (s *Server) handleHead(w http.ResponseWriter,_ *http.Request){
-	json.NewEncoder(w).Encode(s.n.Chain.Head())
+// -------------------------
+// /tx/send
+// -------------------------
+
+func (s *Server) handleSendTx(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var tx types.Transaction
+	if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	if err := tx.ValidateBasic(); err != nil {
+		http.Error(w, "invalid tx: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// optional: verify signature and recover sender
+	if _, err := types.RecoverTxSender(&tx); err != nil {
+		http.Error(w, "invalid signature", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.node.Mempool.AddTx(&tx); err != nil {
+		http.Error(w, "mempool reject: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	resp := map[string]any{
+		"hash": tx.Hash().String(),
+	}
+	writeJSON(w, resp)
 }
 
-func (s *Server) handleBalance(w http.ResponseWriter,r *http.Request){
+// -------------------------
+// /account/balance
+// -------------------------
+
+func (s *Server) handleAccountBalance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	addrStr := r.URL.Query().Get("address")
-	addr,_  := types.ParseAddress(addrStr)
-	bal := s.n.State.GetBalance(addr)
-	nonce:= s.n.State.GetNonce(addr)
+	if addrStr == "" {
+		http.Error(w, "missing address", http.StatusBadRequest)
+		return
+	}
 
-	json.NewEncoder(w).Encode(map[string]any{
+	addr, err := parseAddress(addrStr)
+	if err != nil {
+		http.Error(w, "invalid address", http.StatusBadRequest)
+		return
+	}
+
+	bal := s.node.State.GetBalance(addr)
+	nonce := s.node.State.GetNonce(addr)
+
+	resp := map[string]any{
 		"address": addr.String(),
 		"balance": bal.String(),
 		"nonce":   nonce,
-	})
+	}
+	writeJSON(w, resp)
 }
 
-func (s *Server) handleSendTx(w http.ResponseWriter,r *http.Request){
-	body,_ := io.ReadAll(r.Body)
-	var in struct{
-		ChainId string `json:"chainId"`
-		Nonce uint64  `json:"nonce"`
-		To string     `json:"to"`
-		Value string  `json:"value"`
-		GasPrice string `json:"gasPrice"`
-		GasLimit uint64 `json:"gasLimit"`
-		Data string `json:"data"`
-		R string `json:"r"`
-		S string `json:"s"`
-		V uint8  `json:"v"`
-	}
-	json.Unmarshal(body,&in)
+// -------------------------
+// /chain/head
+// -------------------------
 
-	tx := types.DecodeSignedTx(in)
-	err := s.n.Mempool.AddTx(tx)
-
-	if err!=nil {
-		http.Error(w,err.Error(),400)
+func (s *Server) handleChainHead(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]any{"status":"OK","hash":tx.Hash().String()})
+
+	head := s.node.Chain.Head()
+	if head == nil {
+		http.Error(w, "no head block", http.StatusNotFound)
+		return
+	}
+
+	hdr := head.Header
+	resp := map[string]any{
+		"height":      hdr.Height,
+		"hash":        head.Hash().String(),
+		"parentHash":  hdr.ParentHash.String(),
+		"stateRoot":   hdr.StateRoot.String(),
+		"txRoot":      hdr.TxRoot.String(),
+		"timestamp":   hdr.Timestamp,
+		"proposer":    hdr.Proposer.String(),
+		"witness":     hdr.Witness.String(),
+		"gasLimit":    hdr.GasLimit,
+		"gasUsed":     hdr.GasUsed,
+	}
+	writeJSON(w, resp)
+}
+
+// -------------------------
+// /witness/submit
+// -------------------------
+
+func (s *Server) handleSubmitWitness(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var wt types.Witness
+	if err := json.NewDecoder(r.Body).Decode(&wt); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	// TODO: signature validation for witness:
+	// - verify that wt.Signature is a valid signature over wt.Hash by wt.Address
+	// This requires a helper in types/crypto.go (e.g. VerifyWitness).
+
+	s.node.AddWitness(wt)
+
+	log.Printf("RPC: witness stored addr=%s height=%d\n", wt.Address.String(), wt.BlockHeight)
+
+	resp := map[string]any{
+		"stored":  true,
+		"height":  wt.BlockHeight,
+		"address": wt.Address.String(),
+	}
+	writeJSON(w, resp)
+}
+
+// -------------------------
+// helpers
+// -------------------------
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Println("RPC: write json error:", err)
+	}
+}
+
+func parseAddress(s string) (types.Address, error) {
+	var addr types.Address
+
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return addr, nil
+	}
+
+	s = strings.TrimPrefix(s, "0x")
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return addr, err
+	}
+	if len(b) != len(addr) {
+		return addr, nil
+	}
+	copy(addr[:], b)
+	return addr, nil
 }
