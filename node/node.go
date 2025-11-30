@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Dev KryperAI
+// Dev: KryperAI
 
 package node
 
@@ -8,19 +8,24 @@ import (
 	"sync"
 	"time"
 
+	"krypper-chain/p2p"
 	"krypper-chain/types"
 )
 
 type Node struct {
-	mu           sync.RWMutex
-	Chain        *types.Blockchain
-	State        *types.StateDB
-	Mempool      *types.Mempool
-	Executor     *types.Executor
-	MinerAddress types.Address
+	mu sync.RWMutex
 
-	Running   bool
-	BlockTime time.Duration
+	Chain   *types.Blockchain
+	State   *types.StateDB
+	Mempool *types.Mempool
+	Exec    *types.Executor
+
+	MinerAddress types.Address
+	BlockTime    time.Duration
+
+	P2P *p2p.Manager
+
+	running bool
 }
 
 func NewNode(
@@ -29,31 +34,55 @@ func NewNode(
 	mem *types.Mempool,
 	exec *types.Executor,
 	minerAddr types.Address,
+	p2pMgr *p2p.Manager,
 ) *Node {
 	return &Node{
 		Chain:        chain,
 		State:        state,
 		Mempool:      mem,
-		Executor:     exec,
+		Exec:         exec,
 		MinerAddress: minerAddr,
-		BlockTime:    3 * time.Second,
+		BlockTime:    5 * time.Second,
+		P2P:          p2pMgr,
 	}
 }
 
 func (n *Node) Start() {
 	n.mu.Lock()
-	n.Running = true
+	n.running = true
 	n.mu.Unlock()
 
-	log.Println("NODE: STARTED")
+	log.Println("node: started mining loop")
 	go n.minerLoop()
 }
 
 func (n *Node) Stop() {
 	n.mu.Lock()
-	n.Running = false
+	n.running = false
 	n.mu.Unlock()
-	log.Println("NODE: STOPPED")
+	log.Println("node: stopped")
+}
+
+func (n *Node) IsRunning() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.running
+}
+
+// BroadcastTx lets RPC layer or others relay a tx to peers.
+func (n *Node) BroadcastTx(tx *types.Transaction) {
+	if n.P2P == nil || tx == nil {
+		return
+	}
+	n.P2P.BroadcastTx(tx)
+}
+
+// BroadcastBlock relays newly accepted block to peers.
+func (n *Node) BroadcastBlock(b *types.Block) {
+	if n.P2P == nil || b == nil {
+		return
+	}
+	n.P2P.BroadcastBlock(b)
 }
 
 func (n *Node) minerLoop() {
@@ -61,42 +90,48 @@ func (n *Node) minerLoop() {
 	defer ticker.Stop()
 
 	for {
-		if !n.Running {
+		if !n.IsRunning() {
 			return
 		}
-
 		<-ticker.C
 
-		txs := n.Mempool.PopForBlock(200)
-
-		if len(txs) > 0 {
-			n.produceBlock(txs)
+		txs := n.Mempool.PopForBlock(100)
+		if len(txs) == 0 {
+			continue
 		}
+
+		log.Printf("node: mining candidate block with %d txs\n", len(txs))
+		n.produceBlock(txs)
 	}
 }
 
 func (n *Node) produceBlock(txs []*types.Transaction) {
 	head := n.Chain.Head()
 	if head == nil {
-		log.Println("NO GENESIS — BLOCKING MINING")
+		log.Println("node: cannot mine, no genesis")
 		return
 	}
 
-	header := types.BlockHeader{
+	header := &types.BlockHeader{
 		ParentHash: head.Hash(),
 		Height:     head.Header.Height + 1,
 		Timestamp:  time.Now().Unix(),
-		Proposer:   n.MinerAddress,
 		GasLimit:   30_000_000,
+		Proposer:   n.MinerAddress,
+		// Validator/Witness can be filled by higher-level logic later
 	}
 
+	// dry-run to compute state root
 	snap := n.State.Snapshot()
+	n.Exec.SetBlock(header)
 
-	n.Executor.SetCoinbase(n.MinerAddress)
 	for _, tx := range txs {
-		n.Executor.ExecuteTx(tx)
+		if _, err := n.Exec.ExecuteTx(tx); err != nil {
+			log.Printf("node: tx execution failed in dry run: %v\n", err)
+			n.State.RevertToSnapshot(snap)
+			return
+		}
 	}
-
 	header.StateRoot = n.State.StateRoot()
 	n.State.RevertToSnapshot(snap)
 
@@ -104,9 +139,12 @@ func (n *Node) produceBlock(txs []*types.Transaction) {
 	block.ComputeTxRoot()
 
 	if err := n.Chain.AddBlock(block); err != nil {
-		log.Printf("BLOCK REJECTED — %v\n", err)
+		log.Printf("node: block rejected: %v\n", err)
 		return
 	}
 
-	log.Printf("BLOCK MINED — HEIGHT %d — %s\n", block.Header.Height, block.Hash())
+	log.Printf("node: block #%d mined, hash=%s\n", block.Header.Height, block.Hash().String())
+
+	// relay block to peers
+	n.BroadcastBlock(block)
 }
