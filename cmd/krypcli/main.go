@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Dev: KryperAI
+// Dev: KrypperAI
 
 package main
 
@@ -21,129 +21,110 @@ import (
 	"krypper-chain/types"
 )
 
-const defaultRPC = "http://localhost:8545"
+const RPC = "http://localhost:8545"
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		return
-	}
+	if len(os.Args) < 2 { usage(); return }
+
 	switch os.Args[1] {
-	case "new":
-		cmdNew()
-	case "balance":
-		cmdBalance()
-	case "send":
-		cmdSend()
-	default:
-		usage()
+	case "new":     newWallet()
+	case "balance": balance()
+	case "send":    send()
+	default: usage()
 	}
 }
 
 func usage() {
-	fmt.Println("krypcli commands:")
+	fmt.Println("krypcli usage:")
 	fmt.Println("  krypcli new")
-	fmt.Println("  krypcli balance -addr 0x.. [-rpc URL]")
-	fmt.Println("  krypcli send -priv HEX -to 0x.. -amount WEI [-gas-price] [-gas-limit] [-rpc URL]")
+	fmt.Println("  krypcli balance -addr 0x...")
+	fmt.Println("  krypcli send -priv HEX -to ADDRESS -amount WEI")
 }
 
-func cmdNew() {
+// ---------------- KEY GEN ----------------
+
+func newWallet() {
 	key, addr, _ := types.GenerateKey()
-	priv := hex.EncodeToString(crypto.FromECDSA(key))
-	fmt.Println("PrivateKey:", priv)
+	fmt.Println("Private:", hex.EncodeToString(key.D.Bytes()))
 	fmt.Println("Address:", addr.String())
 }
 
-func cmdBalance() {
+// ---------------- BALANCE ----------------
+
+func balance() {
 	fs := flag.NewFlagSet("balance", flag.ExitOnError)
-	rpcURL := fs.String("rpc", defaultRPC, "")
-	addrStr := fs.String("addr", "", "")
-	_ = fs.Parse(os.Args[2:])
-	if *addrStr == "" {
-		log.Fatal("missing -addr")
-	}
-	url := fmt.Sprintf("%s/account/balance?address=%s", *rpcURL, *addrStr)
-	resp := httpGet(url)
-	fmt.Println(string(resp))
+	addrStr := fs.String("addr","", "0x.. address")
+	rpcURL := fs.String("rpc",RPC,"node rpc")
+	fs.Parse(os.Args[2:])
+
+	addr,_ := parseAddr(*addrStr)
+	url := *rpcURL+"/account/balance?address="+addr.String()
+	body := httpGet(url)
+
+	fmt.Println(string(body))
 }
 
-func cmdSend() {
-	fs := flag.NewFlagSet("send", flag.ExitOnError)
-	rpcURL := fs.String("rpc", defaultRPC, "")
-	privHex := fs.String("priv", "", "")
-	toStr := fs.String("to", "", "")
-	amountStr := fs.String("amount", "", "")
-	gasPriceStr := fs.String("gas-price", "1000000000", "")
-	gasLimit := fs.Uint64("gas-limit", 21000, "")
-	chainID := fs.Uint64("chain-id", 1, "")
-	_ = fs.Parse(os.Args[2:])
+// ---------------- SEND TX ----------------
 
-	if *privHex == "" || *toStr == "" || *amountStr == "" {
-		log.Fatal("missing args")
-	}
+func send() {
+	fs := flag.NewFlagSet("send",flag.ExitOnError)
+	rpcURL := fs.String("rpc",RPC,"node rpc")
+	priv := fs.String("priv","", "private hex")
+	to   := fs.String("to","",   "receiver")
+	amt  := fs.String("amount","", "wei")
 
-	priv, from, _ := loadKey(*privHex)
-	to, _ := parseAddress(*toStr)
-	amount, _ := new(big.Int).SetString(*amountStr, 10)
-	gasPrice, _ := new(big.Int).SetString(*gasPriceStr, 10)
+	fs.Parse(os.Args[2:])
 
-	nonce := queryNonce(*rpcURL, from)
+	key,from,_ := loadKey(*priv)
+	toAddr,_   := parseAddr(*to)
+	value,_    := new(big.Int).SetString(*amt,10)
+	nonce      := getNonce(*rpcURL,from)
 
-	tx := types.NewTransferTx(*chainID, nonce, to, amount, gasPrice, *gasLimit, nil)
-	_ = types.SignTransaction(tx, priv)
+	tx := types.NewTransferTx(1,nonce,toAddr,value,big.NewInt(1_000_000_000),21000,nil)
+	types.SignTransaction(tx,key)
 
-	body := map[string]any{
-		"chainId":  tx.ChainID,
-		"nonce":    tx.Nonce,
-		"to":       tx.To.String(),
-		"value":    tx.Value.String(),
+	req := map[string]any{
+		"chainId":"1",
+		"nonce": tx.Nonce,
+		"to":    tx.To.String(),
+		"value": tx.Value.String(),
 		"gasPrice": tx.GasPrice.String(),
 		"gasLimit": tx.GasLimit,
-		"data":     "0x" + hex.EncodeToString(tx.Data),
-		"r":        "0x" + tx.Signature.R.Text(16),
-		"s":        "0x" + tx.Signature.S.Text(16),
-		"v":        tx.Signature.V,
+		"data": "0x"+hex.EncodeToString(tx.Data),
+		"r": "0x"+tx.Signature.R.Text(16),
+		"s": "0x"+tx.Signature.S.Text(16),
+		"v": tx.Signature.V,
 	}
 
-	j, _ := json.Marshal(body)
-	resp := httpPost(*rpcURL+"/tx/send", j)
-	fmt.Println(string(resp))
+	b,_ := json.Marshal(req)
+	resp,_ := http.Post(*rpcURL+"/tx/send","application/json",bytes.NewReader(b))
+	out,_  := io.ReadAll(resp.Body)
+
+	fmt.Println("TX →",string(out))
 }
 
-func httpGet(url string) []byte {
-	r, _ := http.Get(url)
-	defer r.Body.Close()
-	b, _ := io.ReadAll(r.Body)
-	return b
+// ---------------- HELPERS ----------------
+
+func httpGet(url string) []byte { r,_:=http.Get(url); b,_:=io.ReadAll(r.Body); return b }
+
+func loadKey(h string)(*ecdsa.PrivateKey,types.Address,error){
+	h=strings.TrimPrefix(h,"0x")
+	b,_:=hex.DecodeString(h)
+	k,_:=crypto.ToECDSA(b)
+	return k,types.PubKeyToAddress(&k.PublicKey),nil
 }
 
-func httpPost(url string, data []byte) []byte {
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(data))
-	req.Header.Set("Content-Type",application/json")
-	res, _ := http.DefaultClient.Do(req)
-	defer res.Body.Close()
-	out, _ := io.ReadAll(res.Body)
-	return out
-}
-
-func loadKey(hexKey string) (*ecdsa.PrivateKey, types.Address, error) {
-	h := strings.TrimPrefix(hexKey,"0x")
-	b,_ := hex.DecodeString(h)
-	k,_ := crypto.ToECDSA(b)
-	return k, types.PubKeyToAddress(&k.PublicKey), nil
-}
-
-func parseAddress(s string) (types.Address,error) {
+func parseAddr(s string)(types.Address,error){
 	var a types.Address
 	s=strings.TrimPrefix(s,"0x")
-	b,_ := hex.DecodeString(s)
+	b,_:=hex.DecodeString(s)
 	copy(a[:],b)
 	return a,nil
 }
 
-func queryNonce(url string, addr types.Address) uint64 {
-	r := httpGet(url+"/account/balance?address="+addr.String())
-	var out struct { Nonce uint64 `json:"nonce"` }
-	_ = json.Unmarshal(r,&out)
+func getNonce(url string,addr types.Address)uint64{
+	b:=httpGet(url+"/account/balance?address="+addr.String())
+	var out struct{Nonce uint64 `json:"nonce"` }
+	json.Unmarshal(b,&out)
 	return out.Nonce
 }
