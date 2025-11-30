@@ -31,7 +31,11 @@ func (s *Server) Start(addr string) error {
 	mux.HandleFunc("/chain/head", s.handleHead)
 	mux.HandleFunc("/mempool/info", s.handleMempoolInfo)
 
-	log.Printf("RPC listening on %s\n", addr)
+	// p2p endpoints for internal gossip
+	mux.HandleFunc("/p2p/tx", s.handleP2PTx)
+	mux.HandleFunc("/p2p/block", s.handleP2PBlock)
+
+	log.Printf("rpc: listening on %s\n", addr)
 	return http.ListenAndServe(addr, mux)
 }
 
@@ -65,7 +69,7 @@ type accountResponse struct {
 }
 
 // ------------------------------------------------------------------
-// Handlers
+// Public Handlers
 // ------------------------------------------------------------------
 
 func (s *Server) handleSendTx(w http.ResponseWriter, r *http.Request) {
@@ -152,6 +156,9 @@ func (s *Server) handleSendTx(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// relay to peers
+	s.Node.BroadcastTx(tx)
+
 	writeJSON(w, http.StatusOK, sendTxResponse{
 		TxHash: tx.Hash().String(),
 		Status: "accepted",
@@ -164,21 +171,22 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// URL: /account/0x...
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/account/"), "/")
-	if len(parts) == 0 || parts[0] == "" {
+	path := strings.TrimPrefix(r.URL.Path, "/account/")
+	if path == "" {
 		writeError(w, http.StatusBadRequest, "missing address")
 		return
 	}
 
-	addr, err := parseAddress(parts[0])
+	parts := strings.Split(path, "/")
+	addrStr := parts[0]
+
+	addr, err := parseAddress(addrStr)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid address")
 		return
 	}
 
 	acc := s.Node.State.GetAccount(addr)
-
 	resp := accountResponse{
 		Address: addr.String(),
 		Balance: acc.Balance.String(),
@@ -229,6 +237,60 @@ func (s *Server) handleMempoolInfo(w http.ResponseWriter, r *http.Request) {
 		Pending: s.Node.Mempool.Count(),
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// ------------------------------------------------------------------
+// P2P Handlers (internal node-to-node use)
+// ------------------------------------------------------------------
+
+func (s *Server) handleP2PTx(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var tx types.Transaction
+	if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	if err := tx.ValidateBasic(); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid tx: "+err.Error())
+		return
+	}
+
+	if err := s.Node.Mempool.AddTx(&tx); err != nil {
+		writeError(w, http.StatusBadRequest, "mempool reject: "+err.Error())
+		return
+	}
+
+	// do not re-broadcast to avoid infinite loops
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "ok",
+	})
+}
+
+func (s *Server) handleP2PBlock(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var b types.Block
+	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	if err := s.Node.Chain.AddBlock(&b); err != nil {
+		writeError(w, http.StatusBadRequest, "block reject: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "ok",
+	})
 }
 
 // ------------------------------------------------------------------
