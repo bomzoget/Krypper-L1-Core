@@ -5,116 +5,90 @@ package types
 
 import (
 	"errors"
-	"sync"
 )
 
-// Blockchain - The canonical chain with full state execution.
-type Blockchain struct {
-	mu sync.RWMutex
+// Block is the full block object containing header and transaction list.
+type Block struct {
+	Header       BlockHeader    `json:"header"`
+	Transactions []*Transaction `json:"transactions"`
 
-	blocksByHash   map[Hash]*Block
-	blocksByHeight map[BlockHeight]*Block
-	head           *Block
-
-	state    *StateDB
-	executor *Executor
+	hash Hash `json:"-"`
 }
 
-// NewBlockchain initializes the full chain engine.
-func NewBlockchain(state *StateDB, exec *Executor) *Blockchain {
-	return &Blockchain{
-		blocksByHash:   make(map[Hash]*Block),
-		blocksByHeight: make(map[BlockHeight]*Block),
-		state:          state,
-		executor:       exec,
+// NewBlock creates a new block from header and tx list.
+// Caller is expected to call ComputeTxRoot before finalizing the header hash.
+func NewBlock(header BlockHeader, txs []*Transaction) *Block {
+	return &Block{
+		Header:       header,
+		Transactions: txs,
 	}
 }
 
-// Head returns the current tip block.
-func (bc *Blockchain) Head() *Block {
-	bc.mu.RLock()
-	defer bc.mu.RUnlock()
-	return bc.head
+// Hash returns the block hash (hash of the header).
+// Value is cached after first computation.
+func (b *Block) Hash() Hash {
+	if !b.hash.IsZero() {
+		return b.hash
+	}
+	h := b.Header.HashHeader()
+	b.hash = h
+	return h
 }
 
-// AddBlock → FULL STATE VALIDATION + SNAPSHOT + REVERT
-func (bc *Blockchain) AddBlock(b *Block) error {
+// ComputeTxRoot computes and sets the TxRoot field on the header
+// using a Merkle tree over the transaction hashes.
+func (b *Block) ComputeTxRoot() {
+	if len(b.Transactions) == 0 {
+		b.Header.TxRoot = ZeroHash()
+		return
+	}
+
+	leaves := make([]Hash, 0, len(b.Transactions))
+	for _, tx := range b.Transactions {
+		if tx == nil {
+			continue
+		}
+		leaves = append(leaves, tx.Hash())
+	}
+
+	if len(leaves) == 0 {
+		b.Header.TxRoot = ZeroHash()
+		return
+	}
+
+	root := merkleFromHashes(leaves)
+	b.Header.TxRoot = root
+}
+
+// ValidateBasic performs stateless checks over the block and its transactions.
+// It does not touch StateDB and does not verify signatures at state level.
+func (b *Block) ValidateBasic() error {
 	if b == nil {
 		return errors.New("nil block")
 	}
-	if b.Header == nil {
-		return errors.New("nil block header")
-	}
-	if err := b.ValidateBasic(); err != nil {
-		return err
-	}
 
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
+	// Header-level checks are assumed to be done in HashHeader/consensus layer,
+	// but we can still check simple invariants here if needed.
 
-	// Snapshot first → if block fails = revert to clean state
-	snap := bc.state.Snapshot()
-
-	// Genesis
-	if b.Header.Height == 0 {
-		if bc.head != nil {
-			bc.state.RevertToSnapshot(snap)
-			return errors.New("genesis already exists")
+	// Verify TxRoot matches the actual transaction list.
+	calculatedRoot := ZeroHash()
+	if len(b.Transactions) > 0 {
+		leaves := make([]Hash, 0, len(b.Transactions))
+		for _, tx := range b.Transactions {
+			if tx == nil {
+				return errors.New("nil transaction in block")
+			}
+			if err := tx.ValidateBasic(); err != nil {
+				return err
+			}
+			leaves = append(leaves, tx.Hash())
 		}
-		return bc.commitBlock(b)
+		calculatedRoot = merkleFromHashes(leaves)
 	}
 
-	// Check parent
-	parent, ok := bc.blocksByHash[b.Header.ParentHash]
-	if !ok || parent == nil {
-		bc.state.RevertToSnapshot(snap)
-		return errors.New("unknown parent block")
-	}
-	if b.Header.Height != parent.Header.Height+1 {
-		bc.state.RevertToSnapshot(snap)
-		return errors.New("invalid height")
-	}
-
-	// Execute all tx inside block
-	_, err := bc.executor.ExecuteBlock(b)
-	if err != nil {
-		bc.state.RevertToSnapshot(snap)
-		return err
-	}
-
-	// Verify agreed state root
-	finalRoot := bc.state.StateRoot()
-	if finalRoot != b.Header.StateRoot {
-		bc.state.RevertToSnapshot(snap)
-		return errors.New("state root mismatch")
-	}
-
-	// Accept & Commit to chain
-	return bc.commitBlock(b)
-}
-
-// commitBlock → write block permanently to DB
-func (bc *Blockchain) commitBlock(b *Block) error {
-	h := b.Hash()
-	bc.blocksByHash[h] = b
-	bc.blocksByHeight[b.Header.Height] = b
-
-	if bc.head == nil || b.Header.Height > bc.head.Header.Height {
-		bc.head = b
+	if b.Header.TxRoot != calculatedRoot {
+		return errors.New("tx root mismatch")
 	}
 
 	return nil
-}
-
-// Getters ↓
-func (bc *Blockchain) GetBlockByHash(h Hash) *Block {
-	bc.mu.RLock()
-	defer bc.mu.RUnlock()
-	return bc.blocksByHash[h]
-}
-
-func (bc *Blockchain) GetBlockByHeight(h BlockHeight) *Block {
-	bc.mu.RLock()
-	defer bc.mu.RUnlock()
-	return bc.blocksByHeight[h]
 }
