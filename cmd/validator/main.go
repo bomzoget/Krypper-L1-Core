@@ -5,113 +5,102 @@ package main
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
-
 	"krypper-chain/types"
 )
 
-// Default RPC endpoint
-const defaultRPC = "http://localhost:8545"
-
-type chainHeadResponse struct {
+type headResponse struct {
 	Height uint64 `json:"height"`
 	Hash   string `json:"hash"`
 }
 
 func main() {
-	rpcURL := flag.String("rpc", defaultRPC, "RPC base URL (http://host:port)")
-	privHex := flag.String("priv", "", "validator private key (hex)")
-	chainID := flag.Uint64("chain-id", 1, "chain ID")
-	interval := flag.Duration("interval", 5*time.Second, "poll interval for new blocks")
+	nodeRPC := flag.String("node", "http://localhost:8545", "Node RPC URL")
+	privHex := flag.String("priv", "", "Validator private key (hex)")
+	chainID := flag.Uint64("chain-id", 1, "Chain ID")
 	flag.Parse()
 
 	if *privHex == "" {
-		log.Fatal("missing -priv private key")
+		log.Fatal("missing -priv")
 	}
 
-	// Load private key
-	privKey, addr := mustLoadKey(*privHex)
-	fmt.Println("=== KRYPPER TIER-2 VALIDATOR ===")
-	fmt.Println("Validator address:", addr.String())
-	fmt.Println("RPC endpoint:", *rpcURL)
-	fmt.Println("Chain ID:", *chainID)
-	fmt.Println("Poll interval:", interval.String())
-	fmt.Println()
+	privKey, addr := loadKey(*privHex)
+	fmt.Println("Validator running")
+	fmt.Println("Address:", addr.String())
+	fmt.Println("Node RPC:", *nodeRPC)
 
-	lastHeight := uint64(0)
+	var lastHeight uint64
 
 	for {
-		head, err := fetchChainHead(*rpcURL)
+		h, err := fetchHead(*nodeRPC)
 		if err != nil {
-			log.Println("head error:", err)
-			time.Sleep(*interval)
+			log.Println("fetch head error:", err)
+			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		// No new block
-		if head.Height == 0 || head.Height == lastHeight {
-			time.Sleep(*interval)
+		if h.Height == 0 || h.Height <= lastHeight {
+			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		// Parse block hash
-		blockHash, err := parseHash(head.Hash)
+		fmt.Printf("Validating block #%d (%s)\n", h.Height, h.Hash)
+
+		blockHash, err := parseHash(h.Hash)
 		if err != nil {
 			log.Println("invalid head hash:", err)
-			time.Sleep(*interval)
+			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		// Create and sign validator vote
-		vote, err := types.SignValidatorVote(privKey, *chainID, head.Height, blockHash)
+		vote, err := types.SignValidatorVote(privKey, *chainID, h.Height, blockHash)
 		if err != nil {
 			log.Println("sign vote error:", err)
-			time.Sleep(*interval)
+			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		// Send vote to node
-		if err := submitVote(*rpcURL, vote); err != nil {
+		if err := submitVote(*nodeRPC, vote); err != nil {
 			log.Println("submit vote error:", err)
 		} else {
-			log.Printf("✔ vote submitted for height=%d hash=%s\n", vote.Height, vote.BlockHash.String())
-			lastHeight = head.Height
+			fmt.Println("Vote submitted")
+			lastHeight = h.Height
 		}
 
-		time.Sleep(*interval)
+		time.Sleep(2 * time.Second)
 	}
 }
 
-func fetchChainHead(rpcURL string) (*chainHeadResponse, error) {
-	url := strings.TrimRight(rpcURL, "/") + "/chain/head"
-	resp, err := http.Get(url)
+func fetchHead(rpcURL string) (headResponse, error) {
+	var out headResponse
+
+	resp, err := http.Get(strings.TrimRight(rpcURL, "/") + "/chain/head")
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("chain head error: %s", string(body))
+		return out, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var head chainHeadResponse
-	if err := json.NewDecoder(resp.Body).Decode(&head); err != nil {
-		return nil, err
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, err
 	}
-	return &head, nil
+	return out, nil
 }
 
 func submitVote(rpcURL string, vote *types.ValidatorVote) error {
@@ -120,7 +109,7 @@ func submitVote(rpcURL string, vote *types.ValidatorVote) error {
 		return err
 	}
 
-	url := strings.TrimRight(rpcURL, "/") + "/validator/attest"
+	url := strings.TrimRight(rpcURL, "/") + "/validator/vote"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -135,13 +124,12 @@ func submitVote(rpcURL string, vote *types.ValidatorVote) error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("validator/attest error: %s", string(body))
+		return fmt.Errorf("rpc error %d: %s", resp.StatusCode, string(body))
 	}
-
 	return nil
 }
 
-func mustLoadKey(hexStr string) (*ecdsa.PrivateKey, types.Address) {
+func loadKey(hexStr string) (*ecdsa.PrivateKey, types.Address) {
 	hexStr = strings.TrimSpace(hexStr)
 	if strings.HasPrefix(hexStr, "0x") || strings.HasPrefix(hexStr, "0X") {
 		hexStr = hexStr[2:]
@@ -155,8 +143,8 @@ func mustLoadKey(hexStr string) (*ecdsa.PrivateKey, types.Address) {
 	if err != nil {
 		log.Fatalf("invalid private key: %v", err)
 	}
-	addr := types.PubKeyToAddress(&key.PublicKey)
 
+	addr := types.PubKeyToAddress(&key.PublicKey)
 	return key, addr
 }
 
