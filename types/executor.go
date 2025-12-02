@@ -42,6 +42,12 @@ func (e *Executor) SetBlock(h *BlockHeader) { e.current = h }
 
 func (e *Executor) SetCurrentHeader(h *BlockHeader) { e.current = h }
 
+func (e *Executor) SetCoinbase(addr Address) {
+        if e.current != nil {
+                e.current.Proposer = addr
+        }
+}
+
 // -------------------------------------------------------------
 
 func (e *Executor) ExecuteBlock(b *Block) ([]*Receipt, error) {

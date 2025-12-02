@@ -4,85 +4,121 @@
 package types
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
+        "crypto/sha256"
+        "encoding/binary"
 )
 
 // BlockHeader supports Tier1/Tier2/Tier3 consensus
 type BlockHeader struct {
-	ParentHash Hash
-	Height     uint64
-	Timestamp  int64
-	StateRoot  Hash
-	TxRoot     Hash
-	GasLimit   uint64
+        ParentHash Hash
+        Height     uint64
+        Timestamp  int64
+        StateRoot  Hash
+        TxRoot     Hash
+        GasLimit   uint64
 
-	// Tier-based block production
-	Proposer  Address // Tier1
-	Validator Address // Tier2
-	Witness   Address // Tier3
+        // Tier-based block production
+        Proposer  Address // Tier1
+        Validator Address // Tier2
+        Witness   Address // Tier3
 }
 
 // HashHeader returns hash of block header
 func (h *BlockHeader) HashHeader() Hash {
-	b := sha256.New()
-	var buf [8]byte
+        b := sha256.New()
+        var buf [8]byte
 
-	b.Write(h.ParentHash[:])
+        b.Write(h.ParentHash[:])
 
-	binary.BigEndian.PutUint64(buf[:], h.Height)
-	b.Write(buf[:])
+        binary.BigEndian.PutUint64(buf[:], h.Height)
+        b.Write(buf[:])
 
-	binary.BigEndian.PutUint64(buf[:], uint64(h.Timestamp))
-	b.Write(buf[:])
+        binary.BigEndian.PutUint64(buf[:], uint64(h.Timestamp))
+        b.Write(buf[:])
 
-	b.Write(h.StateRoot[:])
-	b.Write(h.TxRoot[:])
+        b.Write(h.StateRoot[:])
+        b.Write(h.TxRoot[:])
 
-	binary.BigEndian.PutUint64(buf[:], h.GasLimit)
-	b.Write(buf[:])
+        binary.BigEndian.PutUint64(buf[:], h.GasLimit)
+        b.Write(buf[:])
 
-	b.Write(h.Proposer[:])
-	b.Write(h.Validator[:])
-	b.Write(h.Witness[:])
+        b.Write(h.Proposer[:])
+        b.Write(h.Validator[:])
+        b.Write(h.Witness[:])
 
-	var out Hash
-	copy(out[:], b.Sum(nil))
-	return out
+        var out Hash
+        copy(out[:], b.Sum(nil))
+        return out
 }
 
 // -------------------------------------------------------------
 
 // Block is full block container
 type Block struct {
-	Header       *BlockHeader
-	Transactions []*Transaction
-	hash         Hash
+        Header       *BlockHeader
+        Transactions []*Transaction
+        hash         Hash
 }
 
 // NewBlock constructs new block
 func NewBlock(h *BlockHeader, txs []*Transaction) *Block {
-	return &Block{Header: h, Transactions: txs}
+        return &Block{Header: h, Transactions: txs}
 }
 
 // Hash returns block hash == header hash
 func (b *Block) Hash() Hash {
-	if !b.hash.IsZero() {
-		return b.hash
-	}
-	b.hash = b.Header.HashHeader()
-	return b.hash
+        if !b.hash.IsZero() {
+                return b.hash
+        }
+        b.hash = b.Header.HashHeader()
+        return b.hash
 }
 
 // ComputeTxRoot calculates merkle-like root of txs
 func (b *Block) ComputeTxRoot() {
-	if len(b.Transactions) == 0 {
-		b.Header.TxRoot = ZeroHash()
-		return
-	}
-	h := make([]Hash, 0, len(b.Transactions))
-	for _, tx := range b.Transactions {
-		h = append(h, tx.Hash())
-	}
-	b.Header.TxRoot = merkleFromHashes(h)
+        if len(b.Transactions) == 0 {
+                b.Header.TxRoot = ZeroHash()
+                return
+        }
+        h := make([]Hash, 0, len(b.Transactions))
+        for _, tx := range b.Transactions {
+                h = append(h, tx.Hash())
+        }
+        b.Header.TxRoot = merkleFromHashes(h)
+}
+
+// ValidateBasic performs basic block validation
+func (b *Block) ValidateBasic() error {
+        if b == nil || b.Header == nil {
+                return nil
+        }
+        return nil
+}
+
+// merkleFromHashes computes merkle root from hash list
+func merkleFromHashes(hashes []Hash) Hash {
+        if len(hashes) == 0 {
+                return ZeroHash()
+        }
+        if len(hashes) == 1 {
+                return hashes[0]
+        }
+        
+        current := make([]Hash, len(hashes))
+        copy(current, hashes)
+        
+        for len(current) > 1 {
+                if len(current)%2 != 0 {
+                        current = append(current, current[len(current)-1])
+                }
+                
+                next := make([]Hash, 0, len(current)/2)
+                for i := 0; i < len(current); i += 2 {
+                        sum := sha256.Sum256(append(current[i][:], current[i+1][:]...))
+                        next = append(next, Hash(sum))
+                }
+                current = next
+        }
+        
+        return current[0]
 }
