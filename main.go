@@ -4,104 +4,102 @@
 package main
 
 import (
-        "flag"
-        "fmt"
-        "log"
-        "math/big"
-        "strings"
+	"flag"
+	"fmt"
+	"log"
+	"math/big"
+	"strings"
 
-        "krypper-chain/node"
-        "krypper-chain/p2p"
-        "krypper-chain/rpc"
-        "krypper-chain/types"
+	"krypper-chain/config"
+	"krypper-chain/node"
+	"krypper-chain/p2p"
+	"krypper-chain/rpc"
+	"krypper-chain/types"
 )
 
 func main() {
-        // Command args
-        rpcPort := flag.String("port", "8000", "RPC port")
-        peerList := flag.String("peers", "", "Comma separated peer URLs")
-        flag.Parse()
+	rpcPortFlag := flag.String("port", "", "RPC port (overrides RPC_PORT env)")
+	peerListFlag := flag.String("peers", "", "Comma separated peer URLs (overrides PEER_LIST env)")
+	flag.Parse()
 
-        fmt.Println("=== KRYPPER NODE START ===")
+	fmt.Println("=== KRYPPER NODE START ===")
 
-        // Core system
-        state := types.NewStateDB()
-        mempool := types.NewMempool(state)
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatal("CONFIG ERROR:", err)
+	}
 
-        // Miner identity (unique per node)
-        _, minerAddr, _ := types.GenerateKey()
-        fmt.Println("Miner:", minerAddr.String())
+	if *rpcPortFlag != "" {
+		cfg.RPCPort = *rpcPortFlag
+	}
+	if *peerListFlag != "" {
+		cfg.PeerList = *peerListFlag
+	}
 
-        // Trinity economy config
-        var rewardPool types.Address
-        rewardPool[0] = 0xAA
+	cfg.Print()
 
-        cfg := types.ChainConfig{
-                ChainID:    1,
-                RewardPool: rewardPool,
-                ShareTier1: 70,
-                ShareTier2: 20,
-                ShareTier3: 5,
-                SharePool:  5,
-        }
+	state := types.NewStateDB()
+	mempool := types.NewMempool(state)
 
-        exec := types.NewExecutor(state, cfg)
-        chain := types.NewBlockchain(state, exec)
+	minerAddr := cfg.MinerAddress
+	fmt.Println("Miner:", minerAddr.String())
 
-        // ------------------------------
-        // DETERMINISTIC GENESIS
-        // ------------------------------
+	var rewardPool types.Address
+	rewardPool[0] = 0xAA
 
-        var gAddress types.Address
-        gAddress[0] = 0x11 // fixed genesis holder
+	chainCfg := types.ChainConfig{
+		ChainID:    cfg.NetworkID,
+		RewardPool: rewardPool,
+		ShareTier1: 70,
+		ShareTier2: 20,
+		ShareTier3: 5,
+		SharePool:  5,
+	}
 
-        amount := new(big.Int).Mul(big.NewInt(1_000_000), big.NewInt(1e18))
-        state.Mint(gAddress, amount)
+	exec := types.NewExecutor(state, chainCfg)
+	chain := types.NewBlockchain(state, exec)
 
-        genHeader := &types.BlockHeader{
-                ParentHash: types.ZeroHash(),
-                Height:     0,
-                Timestamp:  1700000000, // fixed time + reproducible
-                StateRoot:  state.StateRoot(),
-                TxRoot:     types.ZeroHash(),
-                GasLimit:   30_000_000,
-                Proposer:   gAddress,
-        }
+	var gAddress types.Address
+	gAddress[0] = 0x11
 
-        genesis := types.NewBlock(genHeader, []*types.Transaction{})
-        if err := chain.AddBlock(genesis); err != nil {
-                log.Fatal("GENESIS:", err)
-        }
+	amount := new(big.Int).Mul(big.NewInt(1_000_000), big.NewInt(1e18))
+	state.Mint(gAddress, amount)
 
-        fmt.Println("GENESIS OK:", genesis.Hash())
+	genHeader := &types.BlockHeader{
+		ParentHash: types.ZeroHash(),
+		Height:     0,
+		Timestamp:  1700000000,
+		StateRoot:  state.StateRoot(),
+		TxRoot:     types.ZeroHash(),
+		GasLimit:   30_000_000,
+		Proposer:   gAddress,
+	}
 
-        // ------------------------------
-        // P2P
-        // ------------------------------
-        peers := []string{}
-        if *peerList != "" {
-                peers = strings.Split(*peerList, ",")
-        }
-        _ = p2p.NewManager(peers)
+	genesis := types.NewBlock(genHeader, []*types.Transaction{})
+	if err := chain.AddBlock(genesis); err != nil {
+		log.Fatal("GENESIS:", err)
+	}
 
-        // ------------------------------
-        // NODE
-        // ------------------------------
-        n := node.NewNode(chain, state, mempool, exec, minerAddr)
-        n.Start()
+	fmt.Println("GENESIS OK:", genesis.Hash())
 
-        // ------------------------------
-        // RPC
-        // ------------------------------
-        server := rpc.NewServer(n)
-        go func() {
-                addr := ":" + *rpcPort
-                fmt.Println("RPC:", addr)
-                if err := server.Start(addr); err != nil {
-                        log.Fatal(err)
-                }
-        }()
+	peers := []string{}
+	if cfg.PeerList != "" {
+		peers = strings.Split(cfg.PeerList, ",")
+	}
+	_ = p2p.NewManager(peers)
 
-        fmt.Println("NODE RUNNING")
-        select {}
+	n := node.NewNode(chain, state, mempool, exec, minerAddr)
+	n.Start()
+
+	server := rpc.NewServer(n)
+	go func() {
+		addr := ":" + cfg.RPCPort
+		fmt.Println("RPC:", addr)
+		if err := server.Start(addr); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	fmt.Println("NODE RUNNING")
+	select {}
 }
