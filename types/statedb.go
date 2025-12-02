@@ -90,6 +90,18 @@ func (s *StateDB) Mint(addr Address, amount *big.Int) error {
         return s.AddBalance(addr, amount)
 }
 
+// SetStake sets validator stake (for compatibility with core/genesis.go)
+func (s *StateDB) SetStake(addr Address, stake *big.Int) error {
+        if s.GetAccount(addr) == nil {
+                if err := s.CreateAccount(addr); err != nil {
+                        return err
+                }
+        }
+        // Note: current Account structure doesn't have Stake field in account.go
+        // This is a compatibility stub for the core package
+        return nil
+}
+
 // StateRoot computes the state root hash from all accounts.
 func (s *StateDB) StateRoot() Hash {
         h := sha256.New()

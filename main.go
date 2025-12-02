@@ -18,7 +18,7 @@ import (
 
 func main() {
         // Command args
-        rpcPort := flag.String("port", "8545", "RPC port")
+        rpcPort := flag.String("port", "8000", "RPC port")
         peerList := flag.String("peers", "", "Comma separated peer URLs")
         flag.Parse()
 
